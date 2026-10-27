@@ -37,7 +37,9 @@ tun200 -> server 10.250.1.145, client 10.250.1.146
 
 ```text
 .
+├── CHANGELOG.md
 ├── install_server.sh
+├── sshtun_full.sh
 ├── sshtun_pool_client.sh
 └── sshtun_pool_windows_client
     ├── README.md
@@ -54,6 +56,8 @@ tun200 -> server 10.250.1.145, client 10.250.1.146
         └── wintun
 ```
 
+Суть и причины изменений проекта — в [`CHANGELOG.md`](CHANGELOG.md).
+
 ### `install_server.sh`
 
 Серверный установщик. Он:
@@ -65,8 +69,9 @@ tun200 -> server 10.250.1.145, client 10.250.1.146
 - создаёт service `sshtun-pool-network.service` для подготовки TUN-пула и NAT;
 - генерирует отдельный host key для SSH-TUN сервиса;
 - включает `net.ipv4.ip_forward=1`;
-- создаёт `tun100..tun200`;
-- добавляет минимальные правила NAT/forwarding через WAN-интерфейс.
+- создаёт `tun100..tun200` (диапазон настраивается через `TUN_NUM_START` / `TUN_POOL_SIZE`);
+- добавляет минимальные правила NAT/forwarding через WAN-интерфейс;
+- директивы, которых нет в старом OpenSSH (`PermitListen none`, `PermitOpen none`), добавляет в graceful-режиме — установка не падает на OpenSSH < 7.8, например на Ubuntu 18.04.
 
 Важно: это отдельный SSHD-инстанс на отдельном порту, а не изменение основного SSH на `22/tcp`.
 
@@ -84,6 +89,22 @@ Linux-клиент. Поддерживает:
 - cleanup старых управляемых `tunN`;
 - работу с passphrase-protected ключами через `ssh-agent` или `--ask-passphrase`;
 - `status`, `doctor`, `cleanup`.
+
+### `sshtun_full.sh`
+
+Обёртка над `sshtun_pool_client.sh` для постоянного режима «full-tunnel + исключения» (см. `CHANGELOG.md`). Поддерживает:
+
+- `up` / `down` / `restart` / `status` / `doctor` / `cleanup`;
+- два файла исключений (трафик на них идёт напрямую, мимо туннеля): `~/sshtun/excludes.txt` — базовые (RFC1918 и админские сети) и `~/sshtun/excludes-custom.txt` — пополняемый пользовательский список;
+- `add CIDR...` — добавить сети/адреса в исключения: дописывает в файл и, если туннель поднят, сразу ставит direct-маршрут без перезапуска;
+- параметры подключения (хост, порт, ключ, пул tun, MTU) — переменные в шапке скрипта.
+
+Пример:
+
+```bash
+~/GIT/vpn_over_ssh/sshtun_full.sh up
+~/GIT/vpn_over_ssh/sshtun_full.sh add 203.0.113.0/24
+```
 
 ### `sshtun_pool_windows_client/`
 
