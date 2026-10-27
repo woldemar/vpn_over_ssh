@@ -184,8 +184,6 @@ AllowUsers ${SYSTEM_USER}
 PermitTunnel point-to-point
 AllowTcpForwarding no
 GatewayPorts no
-PermitListen none
-PermitOpen none
 
 PermitTTY no
 X11Forwarding no
@@ -215,6 +213,8 @@ EOF2
 chown root:root "$SSHD_CONFIG"
 chmod 600 "$SSHD_CONFIG"
 try_add_sshd_directive "UnusedConnectionTimeout 60s"
+try_add_sshd_directive "PermitListen none"
+try_add_sshd_directive "PermitOpen none"
 "$SSHD_BIN" -t -f "$SSHD_CONFIG"
 
 cat > "$NETWORK_SCRIPT" <<EOF2
