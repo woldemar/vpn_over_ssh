@@ -80,6 +80,10 @@ install_files() {
     mv -f "$tmp" "$INSTALL_DIR/$f"   # атомарно: работающий процесс не словит битый скрипт
     log "Установлен: $INSTALL_DIR/$f"
   done
+  # Root-хелпер — ЕДИНСТВЕННая команда в NOPASSWD-sudoers (см. setup_sudoers).
+  [[ -f "$REPO_DIR/sshtun_root.sh" ]] || die "Нет файла в репозитории: $REPO_DIR/sshtun_root.sh"
+  install -m 0755 -o root -g wheel "$REPO_DIR/sshtun_root.sh" "$INSTALL_DIR/sshtun-root"
+  log "Root-хелпер: $INSTALL_DIR/sshtun-root (root:wheel 0755)"
   # Шим вместо symlink на скрипт: гарантированно запускает НУЖНЫЙ bash
   # (системный 3.2 не подходит), не зависит от login PATH пользователя.
   cat > "$BIN_DIR/$LINK_NAME" <<EOF
@@ -144,6 +148,29 @@ remove_pf_anchor() {
   fi
 }
 
+# --- sudoers ------------------------------------------------------------------
+# NOPASSWD ровно для одной команды — root-хелпера. env_keep пропускает
+# TUN_NET_* через sudo в бэкенд. Валидация через visudo обязательна:
+# битый sudoers = потерянный sudo.
+SUDOERS_FILE="/etc/sudoers.d/sshtun"
+setup_sudoers() {
+  local tmp=""
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+# vpn_over_ssh client: passwordless sudo только для root-хелпера.
+# Обновляется install_macos.sh; удаляется uninstall'ом.
+Defaults env_keep += "TUN_NET_A TUN_NET_B"
+$INSTALL_USER ALL=(ALL) NOPASSWD: $INSTALL_DIR/sshtun-root
+EOF
+  chmod 0440 "$tmp"
+  visudo -cf "$tmp" >/dev/null || { rm -f "$tmp"; die "visudo отклонил $SUDOERS_FILE"; }
+  install -m 0440 -o root -g wheel "$tmp" "$SUDOERS_FILE"
+  rm -f "$tmp"
+  log "sudoers: $SUDOERS_FILE (NOPASSWD: sshtun-root только)"
+}
+
+remove_sudoers() { rm -f "$SUDOERS_FILE"; log "sudoers убран: $SUDOERS_FILE"; }
+
 # --- launchd ------------------------------------------------------------------
 write_plist() {
   cat > "$PLIST_PATH" <<EOF
@@ -197,6 +224,7 @@ do_install() {
   install_files
   seed_data
   setup_pf_anchor
+  setup_sudoers
   write_plist
   cat <<EOF
 
@@ -224,8 +252,9 @@ do_uninstall() {
   service_disable
   rm -f "$PLIST_PATH" "$BIN_DIR/$LINK_NAME"
   remove_pf_anchor
+  remove_sudoers
   rm -rf "$INSTALL_DIR"
-  log "Скрипты, plist, anchor удалены. Данные (~/sshtun) и лог ($LOG_FILE) оставлены."
+  log "Скрипты, plist, anchor, sudoers удалены. Данные (~/sshtun) и лог ($LOG_FILE) оставлены."
 }
 
 cmd="${1:-install}"

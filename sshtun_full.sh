@@ -114,6 +114,9 @@ if [[ "$UNAME_S" == "Darwin" ]]; then
   CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_macos.sh}"
   RUNTIME_STATE_DIR="/var/run/sshtun"
   MACOS_SERVICE="${MACOS_SERVICE:-com.sshtun.client}"
+  # Единственная root-точка на macOS: root-owned хелпер, разрешённый в
+  # sudoers (NOPASSWD). Прямого «sudo bash» на Darwin не вызываем никогда.
+  ROOT_HELPER="${ROOT_HELPER:-$SCRIPT_DIR/sshtun-root}"
 else
   CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
 fi
@@ -221,6 +224,9 @@ EOFUSAGE
 
 check_client() {
   [[ -f "$CLIENT_SCRIPT" ]] || die "Не найден клиент: $CLIENT_SCRIPT"
+  if [[ "$UNAME_S" == "Darwin" && ! -f "$ROOT_HELPER" ]]; then
+    die "Не найден root-хелпер: $ROOT_HELPER (переустановите install_macos.sh)"
+  fi
 }
 
 check_excludes() {
@@ -240,6 +246,10 @@ check_key() {
 # стандартном hidepid); macOS: ps видит чужие процессы.
 # shellcheck disable=SC1090
 state_var() { # VAR... -> значения через пробел
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    sudo -n "$ROOT_HELPER" state-var "$@" 2>/dev/null || true
+    return 0
+  fi
   sudo -n bash -c '
     s="$1"; shift
     source "$s" 2>/dev/null
@@ -249,6 +259,15 @@ state_var() { # VAR... -> значения через пробел
       (($# > 0)) && printf " "
     done
   ' _ "$RUNTIME_STATE_DIR/state" "$@" 2>/dev/null || true
+}
+
+# Запуск подкоманд бэкенда с правами root.
+client_cmd() { # args...
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    sudo -n "$ROOT_HELPER" backend-run "$@"
+  else
+    sudo bash "$CLIENT_SCRIPT" "$@"
+  fi
 }
 
 tun_is_running() {
@@ -592,7 +611,7 @@ apply_direct_changes() {
   if [[ "$UNAME_S" == "Darwin" ]]; then
     # macOS: diff не нужен — бэкенд пересобирает pf-таблицы из файлов политики
     # (exclude-файлы обёртка уже перезаписала).
-    printf '%s\n' "${ops[@]}" | sudo bash "$CLIENT_SCRIPT" apply-diff \
+    printf '%s\n' "${ops[@]}" | sudo -n "$ROOT_HELPER" backend-run apply-diff \
       && log "Применено изменений маршрутов: ${#ops[@]}" \
       || log "WARNING: apply-diff не удался"
     return 0
@@ -674,7 +693,7 @@ apply_force_changes() {
   table="$(awk '{print $3}' <<<"$rt")"
   if [[ "$UNAME_S" == "Darwin" ]]; then
     # macOS: diff не нужен — бэкенд пересобирает pf-таблицы из файлов политики.
-    printf '%s\n' "${ops[@]}" | sudo bash "$CLIENT_SCRIPT" apply-diff \
+    printf '%s\n' "${ops[@]}" | sudo -n "$ROOT_HELPER" backend-run apply-diff \
       && log "Применено изменений force-маршрутов: ${#ops[@]}" \
       || log "WARNING: apply-diff не удался"
     return 0
@@ -948,8 +967,18 @@ start_vpn() {
     # SUPERVISED=1 в state). TUN_NET_* пробрасываем через env: sudo по
     # умолчанию сбрасывает окружение, а клиент считает IP-пару из него.
     args+=(--foreground)
+    if [[ "$UNAME_S" == "Darwin" ]]; then
+      # env TUN_NET_* проходят через Defaults env_keep (sudoers) в хелпер.
+      exec env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+        sudo -n "$ROOT_HELPER" backend-run start "${args[@]}"
+    fi
     exec sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
       bash "$CLIENT_SCRIPT" start "${args[@]}"
+  fi
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+      sudo -n "$ROOT_HELPER" backend-run start "${args[@]}"
+    return $?
   fi
   sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
     bash "$CLIENT_SCRIPT" start "${args[@]}"
@@ -963,9 +992,8 @@ supervised_marker() {
 # Остановка туннеля, поднятого службой досмотра (systemd / launchd).
 supervisor_stop() {
   if [[ "$UNAME_S" == "Darwin" ]]; then
-    log "Туннель под досмотром launchd — останавливаю: launchctl bootout $MACOS_SERVICE"
-    sudo -n launchctl bootout "system/$MACOS_SERVICE" 2>/dev/null \
-      || sudo -n launchctl stop "$MACOS_SERVICE"
+    log "Туннель под досмотром launchd — останавливаю: bootout $MACOS_SERVICE"
+    sudo -n "$ROOT_HELPER" service-stop
   else
     log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
     sudo -n systemctl stop sshtun
@@ -974,8 +1002,8 @@ supervisor_stop() {
 
 supervisor_restart() {
   if [[ "$UNAME_S" == "Darwin" ]]; then
-    log "Туннель под досмотром launchd — перезапускаю: launchctl kickstart -k $MACOS_SERVICE"
-    sudo -n launchctl kickstart -k "system/$MACOS_SERVICE"
+    log "Туннель под досмотром launchd — перезапускаю: kickstart -k $MACOS_SERVICE"
+    sudo -n "$ROOT_HELPER" service-restart
   else
     log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
     sudo -n systemctl restart sshtun
@@ -990,7 +1018,7 @@ stop_vpn() {
     supervisor_stop
     return
   fi
-  sudo bash "$CLIENT_SCRIPT" stop
+  client_cmd stop
 }
 
 restart_vpn() {
@@ -1518,9 +1546,9 @@ case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
   down|stop)       shift; stop_vpn "$@" ;;
   restart)         shift; restart_vpn "$@" ;;
-  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
-  doctor)          shift; check_client; sudo bash "$CLIENT_SCRIPT" doctor "$@" ;;
-  cleanup)         shift; check_client; sudo bash "$CLIENT_SCRIPT" cleanup "$@" ;;
+  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; client_cmd status "$@" ;;
+  doctor)          shift; check_client; client_cmd doctor "$@" ;;
+  cleanup)         shift; check_client; client_cmd cleanup "$@" ;;
   exclude)
     shift
     [[ $# -ge 1 ]] || die "Укажите подкоманду: $0 exclude add|del CIDR..."
