@@ -50,6 +50,7 @@ IFS=$'\n\t'
 #                       [--net-a A] [--net-b B] [-- комментарий]
 #   server use NAME     переключиться на профиль (переподнимет туннель)
 #   server del NAME     удалить профиль (активный удалить нельзя)
+#   server rename OLD NEW  переименовать профиль (активный тоже)
 #   NAME                сокращение от 'server use NAME' (существующий профиль;
 #                       имена, совпадающие с командами, сокращением не работают)
 #
@@ -156,9 +157,9 @@ usage() {
   $0 exclude del CIDR...    убрать из пользовательских исключений
   $0 include add CIDR... [-- комментарий]    принудительно в туннель (даже если в exclude)
   $0 include del CIDR...    убрать из include-списка
-  $0 fetch-as AS... [--irr]   исключить префиксы AS (RIPEstat / bgpq4)
+  $0 fetch-as AS... [--irr] [-- комментарий]   исключить префиксы AS (RIPEstat / bgpq4)
   $0 fetch-as --remove AS... убрать AS из автогенного списка
-  $0 fetch-country CC...     исключить префиксы стран (ipdeny.com)
+  $0 fetch-country CC... [-- комментарий]  исключить префиксы стран (ipdeny.com)
   $0 fetch-country --remove CC...  убрать страну из списка
   $0 refresh            перекачать все автогенные списки
   $0 list               показать маршрутную политику
@@ -172,6 +173,7 @@ usage() {
   $0 server use NAME    переключиться на профиль (туннель переподнимется,
                         если работает; иначе применится при следующем up)
   $0 server del NAME    удалить профиль (активный удалить нельзя)
+  $0 server rename OLD NEW   переименовать профиль (активный тоже; туннель не тронет)
   $0 NAME               сокращение от 'server use NAME' (существующий профиль)
 
 Устаревшие алиасы: add/del = exclude add/del; force-add/force-del = include add/del.
@@ -438,6 +440,29 @@ server_del() {
   log "Профиль '$name' удалён"
 }
 
+server_rename() { # old new
+  local old="${1:-}" new="${2:-}"
+  [[ -n "$old" && -n "$new" ]] || die "Укажите: $0 server rename СТАРОЕ_ИМЯ НОВОЕ_ИМЯ"
+  [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || die "Недопустимое имя профиля: $new (допустимы [A-Za-z0-9_-], начало с буквы/цифры)"
+  local src="$SERVERS_DIR/$old.conf" dst="$SERVERS_DIR/$new.conf"
+  [[ -f "$src" ]] || die "Профиль не найден: $src"
+  [[ ! -f "$dst" ]] || die "Профиль '$new' уже существует: $dst"
+  # Шапку профиля (строки с комментариями) приводим к новому имени —
+  # там шаблонные 'server OLD' и 'server use OLD'. Содержимое не трогаем.
+  sed -i "/^#/s/'$old'/'$new'/g; /^#/s/use $old\$/use $new/" "$src"
+  mv -f "$src" "$dst"
+  restore_owner "$dst"
+  if [[ "$(active_profile)" == "$old" ]]; then
+    # Активный профиль: обновить маркер в server.conf. Параметры сервера
+    # не меняются — переподнимать туннель не нужно.
+    activate_profile "$new"
+    log "Активный профиль переименован: $old -> $new (маркер обновлён, туннель не тронут)"
+  else
+    log "Профиль переименован: $old -> $new"
+  fi
+}
+
 server_use() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "Укажите имя профиля: $0 server use NAME (список: sshtun server list)"
@@ -631,32 +656,95 @@ policy_table_direct_runtime() {
 # Токены-источники из тела файла (по одному на строку).
 file_tokens() {
   [[ -f "$1" ]] || return 0
-  grep -E '^(AS[0-9]+|[A-Za-z]{2})$' "$1" || true
+  # Токены могут иметь inline-комментарий "AS9009 # пояснение" — отсекаем.
+  sed -e 's/#.*//' -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$1" \
+    | grep -E '^(AS[0-9]+|[A-Za-z]{2})$' || true
+}
+
+# Сырые строки токенов с комментариями ("AS9009 # пояснение") — для 'list'.
+token_lines() {
+  [[ -f "$1" ]] || return 0
+  grep -E '^(AS[0-9]+|[A-Za-z]{2})([[:space:]]*#|$)' "$1" || true
+}
+
+# Разобрать аргументы fetch: токены... [-- комментарий].
+# nameref: _tokens (массив), _comment (строка).
+parse_tokens_comment() {
+  local -n _tokens="$1"
+  local -n _comment="$2"
+  shift 2
+  _tokens=()
+  _comment=""
+  local seen_ddash=0 arg=""
+  for arg in "$@"; do
+    if (( seen_ddash == 0 )) && [[ "$arg" == "--" ]]; then
+      seen_ddash=1
+      continue
+    fi
+    if (( seen_ddash == 1 )); then
+      _comment+="${_comment:+ }$arg"
+    else
+      _tokens+=("$arg")
+    fi
+  done
 }
 
 # Шапка файла-токенов (AS / страны).
 token_file_header() {
   cat <<'EOF'
 # SSHTUN: источники автогенных префиксов. Формат: один токен на строку —
-# AS9009 (автономная система) или ISO-код страны (ru, de, us). Комментарии
-# (#) и пустые строки допустимы. Префиксы скачиваются в ~/sshtun/generated/
-# командой 'sshtun refresh' или автоматически при 'up' (при недоступности
-# сети используется последний кэш из generated/).
-# Добавить/убрать: sshtun fetch-as AS9009 | fetch-as --remove AS9009
-#                 sshtun fetch-country ru | fetch-country --remove ru
+# AS9009 (автономная система) или ISO-код страны (ru, de, us), к нему можно
+# добавить комментарий: "AS9009 # пояснение" (строки "# ..." и пустые —
+# тоже комментарии). Префиксы скачиваются в ~/sshtun/generated/ командой
+# 'sshtun refresh' или автоматически при 'up' (при недоступности сети
+# используется последний кэш из generated/).
+# Добавить/убрать: sshtun fetch-as AS9009 [-- комментарий] | fetch-as --remove AS9009
+#                 sshtun fetch-country ru [-- комментарий] | fetch-country --remove ru
 EOF
 }
 
+# Привязать/обновить комментарий для КОНКРЕТНЫХ токенов файла (остальные
+# не трогаем). Реализовано как «убрать целевые строки, дописать с новым
+# комментарием» — write_token_file ниже подхватит комментарии из файла.
+set_token_comments() { # file comment token...
+  local file="$1" comment="$2"; shift 2
+  ((${#@} > 0)) || return 0
+  local pat="" t="" tmp=""
+  pat="$(printf '%s|' "$@")"; pat="${pat%|}"
+  tmp="$(mktemp "$file.XXXXXX")" || die "mktemp failed"
+  {
+    [[ -f "$file" ]] && grep -vE "^(${pat})([[:space:]]|$)" "$file" || true
+    for t in "$@"; do
+      printf '%s # %s\n' "$t" "$comment"
+    done
+  } > "$tmp"
+  mv -f "$tmp" "$file"
+  restore_owner "$file"
+}
+
 # Перезаписать файл-токенов: свежая шапка + пользовательские комментарии
-# + токены (отсортированные, уникальные). Старые управляемые шапки
-# автоген-формата и инлайн-префиксы (legacy) выбрасываются. Если токенов
-# не осталось и пользовательского содержимого тоже нет — файл удаляется.
+# + токены (отсортированные, уникальные) с сохранёнными inline-комментариями
+# (токен -> комментарий читается из старого содержимого; новые — через
+# set_token_comments ДО вызова). Старые управляемые шапки автоген-формата
+# и инлайн-префиксы (legacy) выбрасываются. Если токенов не осталось и
+# пользовательского содержимого тоже нет — файл удаляется.
 write_token_file() { # file token...
   local file="$1"; shift
   local kept="" user_lines=""
+  local -A cmt=()
   if [[ -f "$file" ]]; then
+    # Существующие inline-комментарии: токен -> текст после '#'.
+    local line="" tok="" c=""
+    while IFS= read -r line; do
+      tok="${line%%#*}"
+      tok="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$tok")"
+      [[ "$tok" =~ ^(AS[0-9]+|[A-Za-z]{2})$ ]] || continue
+      c=""
+      [[ "$line" == *#* ]] && c="$(sed -e 's/^[^#]*#[[:space:]]*//' <<<"$line")"
+      cmt["$tok"]="$c"
+    done < "$file"
     kept="$(grep -vE '^# (SSHTUN:|командами:|Дописывать можно|они развернутся|Источники:|Данные:|Обновлено:|sshtun-managed-sources:)' "$file" \
-      | grep -vE '^(AS[0-9]+|[A-Za-z]{2})$' \
+      | grep -vE '^(AS[0-9]+|[A-Za-z]{2})([[:space:]]|$)' \
       | grep -vE '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]+$' || true)"
     user_lines="$(grep -vE '^[[:space:]]*(#|$)' <<<"$kept" || true)"
   fi
@@ -664,13 +752,17 @@ write_token_file() { # file token...
     rm -f "$file"
     return 0
   fi
-  local tmp
+  local tmp t=""
   tmp="$(mktemp "$file.XXXXXX")" || die "mktemp failed"
   {
     token_file_header
     [[ -n "$kept" ]] && printf '%s\n' "$kept"
     if [[ $# -gt 0 ]]; then
-      printf '%s\n' "$@" | sort -u
+      local sorted=""
+      sorted="$(printf '%s\n' "$@" | sort -u)"
+      while IFS= read -r t; do
+        [[ -n "${cmt[$t]:-}" ]] && printf '%s # %s\n' "$t" "${cmt[$t]}" || printf '%s\n' "$t"
+      done <<<"$sorted"
     fi
   } > "$tmp"
   mv -f "$tmp" "$file"
@@ -961,9 +1053,7 @@ file_sources() {
   local file="$1"
   {
     managed_sources "$file"
-    if [[ -f "$file" ]]; then
-      grep -E '^(AS[0-9]+|[A-Za-z]{2})$' "$file" || true
-    fi
+    file_tokens "$file"
   } | tr '\n' ' '
 }
 
@@ -1044,17 +1134,19 @@ diff_entries() { # old_file new_file
 }
 
 fetch_as() {
-  local use_irr=0 asns=() rm_asns=() a=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --irr) use_irr=1; shift ;;
-      --remove) shift
-         [[ "${1:-}" =~ ^(AS)?[0-9]+$ ]] || die "Не похоже на номер AS: ${1:-}"
-         a="${1#AS}"; a="AS${a}"
-         rm_asns+=("$a"); shift ;;
-      *) [[ "$1" =~ ^(AS)?[0-9]+$ ]] || die "Не похоже на номер AS: $1 (нужно вида AS9009)"
-         a="${1#AS}"; a="AS${a}"
-         asns+=("$a"); shift ;;
+  local use_irr=0 comment="" i=0 a="" next=""
+  local -a asns=() rm_asns=() args=()
+  parse_tokens_comment args comment "$@"
+  for (( i=0; i<${#args[@]}; i++ )); do
+    a="${args[$i]}"
+    case "$a" in
+      --irr) use_irr=1 ;;
+      --remove)
+         next="${args[$((i+1))]:-}"
+         [[ "$next" =~ ^(AS)?[0-9]+$ ]] || die "Не похоже на номер AS: ${next:-(пусто)}"
+         rm_asns+=("AS${next#AS}") ;;
+      *) [[ "$a" =~ ^(AS)?[0-9]+$ ]] || die "Не похоже на номер AS: $a (нужно вида AS9009)"
+         asns+=("AS${a#AS}") ;;
     esac
   done
   ((${#asns[@]} >= 1 || ${#rm_asns[@]} >= 1)) || die "Укажите хотя бы одну AS: $0 fetch-as AS9009"
@@ -1066,9 +1158,15 @@ fetch_as() {
     log "Убираю AS: $(join_spaced "${rm_asns[@]}")"
   else
     mapfile -t src_array < <(merge_sources "$AS_EXCLUDES" "${asns[@]}")
+    [[ -n "$comment" ]] && log "Комментарий к AS: $comment"
   fi
 
-  # Файл-токенов перезаписываем всегда (только токены); префиксы — в generated/.
+  # Комментарий привязываем ТОЛЬКО к токенам текущего вызова (не ко всем
+  # источникам файла), затем перезаписываем файл (токены + комментарии);
+  # префиксы — в generated/.
+  if [[ -n "$comment" && ${#asns[@]} -gt 0 ]]; then
+    set_token_comments "$AS_EXCLUDES" "$comment" "${asns[@]}"
+  fi
   write_token_file "$AS_EXCLUDES" "${src_array[@]}"
 
   if ((${#src_array[@]} == 0)); then
@@ -1122,16 +1220,18 @@ fetch_as() {
 }
 
 fetch_country() {
-  local ccs=() rm_ccs=() c=""
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --remove) shift
-         [[ "${1:-}" =~ ^[A-Za-z]{2}$ ]] || die "Не похоже на код страны: ${1:-}"
-         c="$(tr 'A-Z' 'a-z' <<<"${1}")"
-         rm_ccs+=("$c"); shift ;;
-      *) [[ "$1" =~ ^[A-Za-z]{2}$ ]] || die "Не похоже на код страны: $1 (нужно вида ru, de, us)"
-         c="$(tr 'A-Z' 'a-z' <<<"$1")"
-         ccs+=("$c"); shift ;;
+  local comment="" i=0 a="" next=""
+  local -a ccs=() rm_ccs=() args=()
+  parse_tokens_comment args comment "$@"
+  for (( i=0; i<${#args[@]}; i++ )); do
+    a="${args[$i]}"
+    case "$a" in
+      --remove)
+         next="${args[$((i+1))]:-}"
+         [[ "$next" =~ ^[A-Za-z]{2}$ ]] || die "Не похоже на код страны: ${next:-(пусто)}"
+         rm_ccs+=("$(tr 'A-Z' 'a-z' <<<"$next")") ;;
+      *) [[ "$a" =~ ^[A-Za-z]{2}$ ]] || die "Не похоже на код страны: $a (нужно вида ru, de, us)"
+         ccs+=("$(tr 'A-Z' 'a-z' <<<"$a")") ;;
     esac
   done
   ((${#ccs[@]} >= 1 || ${#rm_ccs[@]} >= 1)) || die "Укажите хотя бы одну страну: $0 fetch-country ru"
@@ -1145,9 +1245,13 @@ fetch_country() {
     log "Убираю страны: $(join_spaced "${rm_ccs[@]}")"
   else
     mapfile -t src_array < <(merge_sources "$COUNTRY_EXCLUDES" "${ccs[@]}")
+    [[ -n "$comment" ]] && log "Комментарий к странам: $comment"
   fi
 
-  # Файл-токенов перезаписываем всегда (только токены); префиксы — в generated/.
+  # Комментарий привязываем только к странам текущего вызова; префиксы — в generated/.
+  if [[ -n "$comment" && ${#ccs[@]} -gt 0 ]]; then
+    set_token_comments "$COUNTRY_EXCLUDES" "$comment" "${ccs[@]}"
+  fi
   write_token_file "$COUNTRY_EXCLUDES" "${src_array[@]}"
 
   if ((${#src_array[@]} == 0)); then
@@ -1272,7 +1376,7 @@ list_policy() {
       t="$(file_tokens "$f" | grep -c . || true)"
       printf '    %-18s %6s токен(ов)   %s\n' "$title" "$t" "$f"
       if (( t > 0 )); then
-        file_tokens "$f" | sed 's/^/      /'
+        token_lines "$f" | sed 's/^/      /'
       fi
       if [[ "$f" == "$AS_EXCLUDES" || "$f" == "$COUNTRY_EXCLUDES" ]] && (( n > 0 )); then
         printf '    %-18s %6s префиксов (legacy-инлайн, ещё не мигрировано)\n' "" "$n"
@@ -1351,7 +1455,8 @@ case "$cmd" in
       add)      server_add "$@" ;;
       use)      server_use "$@" ;;
       del|rm)   server_del "$@" ;;
-      *) die "Неизвестная подкоманда: server $sub (нужно list|add|use|del)" ;;
+      rename|mv) server_rename "$@" ;;
+      *) die "Неизвестная подкоманда: server $sub (нужно list|add|use|del|rename)" ;;
     esac ;;
   -h|--help|help|"") usage ;;
   *)
