@@ -277,7 +277,11 @@ apply_diff() {
 }
 
 # --- DNS --------------------------------------------------------------------
-net_service_for_dev() { # en0 -> "Wi-Fi"
+# networksetup -setdnsservers на macOS 15 ( Sonoma+ тоже) из фоновых/daemon
+# процессов отказывает (privacy-ограничения) — работаем через scutil с
+# Setup:/Network/Service/<UUID>/DNS (классический API VPN-клиентов).
+# UUID основного сервиса берём из State:/Network/Global/IPv4 (PrimaryService).
+net_service_for_dev() { # en0 -> "Wi-Fi" (для сообщений)
   networksetup -listnetworkserviceorder 2>/dev/null \
     | awk -v dev="$1" '
         /^\([0-9]+\)/ { svc=$0 }
@@ -288,42 +292,58 @@ net_service_for_dev() { # en0 -> "Wi-Fi"
         }'
 }
 
+primary_service_uuid() {
+  scutil <<< "show State:/Network/Global/IPv4" 2>/dev/null \
+    | awk '/PrimaryService :/{print $3; exit}'
+}
+
+dns_current_servers() { # UUID -> "1.1.1.1 8.8.8.8" или пусто
+  local uuid="$1" out=""
+  out="$(scutil <<< "show Setup:/Network/Service/$uuid/DNS" 2>/dev/null || true)"
+  awk '/^[[:space:]]+[0-9]+ : /{printf "%s ", $3} END{printf "\n"}' <<<"$out" \
+    | sed -e 's/[[:space:]]*$//'
+}
+
 dns_save_and_set() {
+  local uuid=""
+  uuid="$(primary_service_uuid)"
+  [[ -n "$uuid" ]] || { log "WARNING: не нашёл PrimaryService — DNS не трогаю"; return 0; }
   DNS_SERVICE="$(net_service_for_dev "$DEFAULT_DEV")"
-  [[ -n "$DNS_SERVICE" ]] || { log "WARNING: не нашёл network-сервис для $DEFAULT_DEV — DNS не трогаю"; return 0; }
-  local old_srv old_dom
-  old_srv="$(networksetup -getdnsservers "$DNS_SERVICE" 2>/dev/null || true)"
-  old_dom="$(networksetup -getsearchdomains "$DNS_SERVICE" 2>/dev/null || true)"
+  local old_srv=""
+  old_srv="$(dns_current_servers "$uuid")"
   {
     printf 'DNS_SERVICE=%q\n' "$DNS_SERVICE"
+    printf 'DNS_SERVICE_UUID=%q\n' "$uuid"
     printf 'DNS_OLD_SERVERS=%q\n' "$old_srv"
-    printf 'DNS_OLD_DOMAINS=%q\n' "$old_dom"
   } >> "$STATE_FILE"
   # shellcheck disable=SC2086
-  networksetup -setdnsservers "$DNS_SERVICE" $DNS_SERVERS >/dev/null \
-    || { log "WARNING: setdnsservers не удался"; return 0; }
-  networksetup -setsearchdomains "$DNS_SERVICE" Empty >/dev/null 2>&1 || true
+  scutil >/dev/null 2>&1 <<EOF || { log "WARNING: scutil set DNS не удался"; return 0; }
+d.init
+d.add ServerAddresses * $DNS_SERVERS
+set Setup:/Network/Service/$uuid/DNS
+EOF
   DNS_SAVED=1
-  log "DNS $DNS_SERVICE -> $DNS_SERVERS"
+  log "DNS ${DNS_SERVICE:-$uuid} -> $DNS_SERVERS"
 }
 
 dns_restore() {
   # shellcheck disable=SC1090
   source "$STATE_FILE" 2>/dev/null || return 0
-  [[ -n "${DNS_SERVICE:-}" ]] || return 0
-  if [[ "${DNS_OLD_SERVERS:-}" == There* || -z "${DNS_OLD_SERVERS:-}" ]]; then
-    networksetup -setdnsservers "$DNS_SERVICE" Empty >/dev/null 2>&1 || true
+  local uuid="${DNS_SERVICE_UUID:-}"
+  [[ -n "$uuid" ]] || return 0
+  if [[ -z "${DNS_OLD_SERVERS:-}" ]]; then
+    scutil >/dev/null 2>&1 <<EOF
+remove Setup:/Network/Service/$uuid/DNS
+EOF
   else
     # shellcheck disable=SC2086
-    networksetup -setdnsservers "$DNS_SERVICE" ${DNS_OLD_SERVERS//$'\n'/ } >/dev/null 2>&1 || true
+    scutil >/dev/null 2>&1 <<EOF
+d.init
+d.add ServerAddresses * ${DNS_OLD_SERVERS}
+set Setup:/Network/Service/$uuid/DNS
+EOF
   fi
-  if [[ "${DNS_OLD_DOMAINS:-}" == There* || -z "${DNS_OLD_DOMAINS:-}" ]]; then
-    networksetup -setsearchdomains "$DNS_SERVICE" Empty >/dev/null 2>&1 || true
-  else
-    # shellcheck disable=SC2086
-    networksetup -setsearchdomains "$DNS_SERVICE" ${DNS_OLD_DOMAINS//$'\n'/ } >/dev/null 2>&1 || true
-  fi
-  log "DNS $DNS_SERVICE восстановлен"
+  log "DNS ${DNS_SERVICE:-$uuid} восстановлен"
 }
 
 # --- ssh и utun -------------------------------------------------------------
@@ -534,9 +554,9 @@ stop_cleanup() {
 
   pf_flush_anchor
 
-  # utun закроется сам при смерти ssh; если остался — down
+  # utun не всегда исчезает при закрытии fd — уничтожаем явно
   if [[ -n "${TUN_DEV:-}" ]]; then
-    ifconfig "${TUN_DEV}" down 2>/dev/null || true
+    ifconfig "${TUN_DEV}" destroy 2>/dev/null || ifconfig "${TUN_DEV}" down 2>/dev/null || true
   fi
 
   rm -f "$STATE_FILE" "$STATE_DIR/ssh.pid"
@@ -624,8 +644,7 @@ cleanup_vpn() {
   local leftovers=""
   for d in $(utun_list); do
     if ifconfig "$d" 2>/dev/null | grep -q "inet ${TUN_NET_A}.${TUN_NET_B}."; then
-      ifconfig "$d" down 2>/dev/null || true
-      ifconfig "$d" destroy 2>/dev/null || true
+      ifconfig "$d" destroy 2>/dev/null || ifconfig "$d" down 2>/dev/null || true
       leftovers+=" $d"
     fi
   done
