@@ -50,6 +50,7 @@ IFS=$'\n\t'
 #                       [--net-a A] [--net-b B] [-- комментарий]
 #   server use NAME     переключиться на профиль (переподнимет туннель)
 #   server del NAME     удалить профиль (активный удалить нельзя)
+#   server rename OLD NEW  переименовать профиль (активный тоже)
 #   NAME                сокращение от 'server use NAME' (существующий профиль;
 #                       имена, совпадающие с командами, сокращением не работают)
 #
@@ -172,6 +173,7 @@ usage() {
   $0 server use NAME    переключиться на профиль (туннель переподнимется,
                         если работает; иначе применится при следующем up)
   $0 server del NAME    удалить профиль (активный удалить нельзя)
+  $0 server rename OLD NEW   переименовать профиль (активный тоже; туннель не тронет)
   $0 NAME               сокращение от 'server use NAME' (существующий профиль)
 
 Устаревшие алиасы: add/del = exclude add/del; force-add/force-del = include add/del.
@@ -436,6 +438,29 @@ server_del() {
     || die "Профиль '$name' активен — сначала переключитесь: sshtun server use ДРУГОЕ_ИМЯ"
   rm -f "$f"
   log "Профиль '$name' удалён"
+}
+
+server_rename() { # old new
+  local old="${1:-}" new="${2:-}"
+  [[ -n "$old" && -n "$new" ]] || die "Укажите: $0 server rename СТАРОЕ_ИМЯ НОВОЕ_ИМЯ"
+  [[ "$new" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || die "Недопустимое имя профиля: $new (допустимы [A-Za-z0-9_-], начало с буквы/цифры)"
+  local src="$SERVERS_DIR/$old.conf" dst="$SERVERS_DIR/$new.conf"
+  [[ -f "$src" ]] || die "Профиль не найден: $src"
+  [[ ! -f "$dst" ]] || die "Профиль '$new' уже существует: $dst"
+  # Шапку профиля (строки с комментариями) приводим к новому имени —
+  # там шаблонные 'server OLD' и 'server use OLD'. Содержимое не трогаем.
+  sed -i "/^#/s/'$old'/'$new'/g; /^#/s/use $old\$/use $new/" "$src"
+  mv -f "$src" "$dst"
+  restore_owner "$dst"
+  if [[ "$(active_profile)" == "$old" ]]; then
+    # Активный профиль: обновить маркер в server.conf. Параметры сервера
+    # не меняются — переподнимать туннель не нужно.
+    activate_profile "$new"
+    log "Активный профиль переименован: $old -> $new (маркер обновлён, туннель не тронут)"
+  else
+    log "Профиль переименован: $old -> $new"
+  fi
 }
 
 server_use() {
@@ -1351,7 +1376,8 @@ case "$cmd" in
       add)      server_add "$@" ;;
       use)      server_use "$@" ;;
       del|rm)   server_del "$@" ;;
-      *) die "Неизвестная подкоманда: server $sub (нужно list|add|use|del)" ;;
+      rename|mv) server_rename "$@" ;;
+      *) die "Неизвестная подкоманда: server $sub (нужно list|add|use|del|rename)" ;;
     esac ;;
   -h|--help|help|"") usage ;;
   *)
