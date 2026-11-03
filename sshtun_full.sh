@@ -104,7 +104,19 @@ while [[ -L "$SCRIPT_PATH" ]]; do
   [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_LINK_DIR/$SCRIPT_PATH"
 done
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P)"
-CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
+UNAME_S="${UNAME_S:-$(uname -s 2>/dev/null || echo Linux)}"
+# State-файл работающего туннеля лежит в root-only каталоге: /run на Linux,
+# /var/run на macOS (физически /private/var/run).
+RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-/run/sshtun}"
+# Бэкенд: тот же контракт CLI/state. macOS-вариант гоняет маршруты через
+# pfctl (route-to), DNS через networksetup, lock через mkdir (flock нет).
+if [[ "$UNAME_S" == "Darwin" ]]; then
+  CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_macos.sh}"
+  RUNTIME_STATE_DIR="/var/run/sshtun"
+  MACOS_SERVICE="${MACOS_SERVICE:-com.sshtun.client}"
+else
+  CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
+fi
 
 EXCLUDES_DIR="${EXCLUDES_DIR:-$HOME/sshtun}"
 # Профили серверов: библиотека в servers/*.conf + активный server.conf.
@@ -129,18 +141,33 @@ COUNTRY_GENERATED="$GENERATED_DIR/excludes-country.txt"
 # Таблицы policy routing — должны совпадать с клиентом (он пишет их в state).
 POLICY_TABLE_DIRECT="${POLICY_TABLE_DIRECT:-200}"
 
-log(){ echo "[$(date -Is)] $*" 2>/dev/null || true; }
+# GNU date умеет -Is, BSD (macOS) — нет: собираем вручную, %z -> +HH:MM.
+ts_iso(){ date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null | sed -E 's/([0-9]{2})$/:\1/' || true; }
+log(){ echo "[$(ts_iso)] $*" 2>/dev/null || true; }
 die(){ echo "[ERROR] $*" >&2 || true; exit 1; }
 
 # Под systemd обёртка работает от root, а файлы данных должен править
 # пользователь — возвращаем владельцу ~/sshtun и читаемые права (работает
 # и для generated/: ссылка — всегда на каталог данных, не на родителя).
 restore_owner() { # path
-  chown --reference="$EXCLUDES_DIR" "$1" 2>/dev/null || true
+  # chown --reference и stat -c — GNU-специфика; на macOS stat -f.
+  local owner=""
+  owner="$(stat -c '%U:%G' "$EXCLUDES_DIR" 2>/dev/null || stat -f '%Su:%Sg' "$EXCLUDES_DIR" 2>/dev/null || true)"
+  [[ -n "$owner" ]] && chown "$owner" "$1" 2>/dev/null || true
   if [[ -d "$1" ]]; then
     chmod 0755 "$1" 2>/dev/null || true
   else
     chmod 0644 "$1" 2>/dev/null || true
+  fi
+}
+
+# sed -i на BSD требует аргумент суффикса бэкапа (sed -i '').
+sed_i() { # file expr
+  local f="$1"; shift
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    sed -i '' "$@" "$f"
+  else
+    sed -i "$@" "$f"
   fi
 }
 
@@ -207,13 +234,31 @@ check_key() {
 Затем добавить публичный ключ на сервер в /opt/sshtun_pool/authorized_keys"
 }
 
-# 1 — туннель работает, 0 — нет. State-файл лежит в /run/sshtun (root-only).
-# kill -0 не подходит: sshd-клиент работает от root, и обычный пользователь
-# получает EPERM. Проверяем через /proc (читаем всем при стандартном hidepid).
+# 1 — туннель работает, 0 — нет. State-файл лежит в root-only каталоге
+# (RUNTIME_STATE_DIR). kill -0 не подходит: sshd-клиент работает от root, и
+# обычный пользователь получает EPERM. Linux: /proc (читаем всем при
+# стандартном hidepid); macOS: ps видит чужие процессы.
+# shellcheck disable=SC1090
+state_var() { # VAR... -> значения через пробел
+  sudo -n bash -c '
+    s="$1"; shift
+    source "$s" 2>/dev/null
+    while (($#)); do
+      eval "printf \"%s\" \"\${$1:-}\""
+      shift
+      (($# > 0)) && printf " "
+    done
+  ' _ "$RUNTIME_STATE_DIR/state" "$@" 2>/dev/null || true
+}
+
 tun_is_running() {
   local pid=""
-  pid="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${SSH_PID:-}"' 2>/dev/null || true)"
+  pid="$(state_var SSH_PID)"
   [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    ps -p "$pid" -o pid= >/dev/null 2>&1
+    return $?
+  fi
   [[ -d "/proc/$pid" ]] && return 0
   kill -0 "$pid" 2>/dev/null
 }
@@ -450,7 +495,7 @@ server_rename() { # old new
   [[ ! -f "$dst" ]] || die "Профиль '$new' уже существует: $dst"
   # Шапку профиля (строки с комментариями) приводим к новому имени —
   # там шаблонные 'server OLD' и 'server use OLD'. Содержимое не трогаем.
-  sed -i "/^#/s/'$old'/'$new'/g; /^#/s/use $old\$/use $new/" "$src"
+  sed_i "$src" "/^#/s/'$old'/'$new'/g; /^#/s/use $old\$/use $new/"
   mv -f "$src" "$dst"
   restore_owner "$dst"
   if [[ "$(active_profile)" == "$old" ]]; then
@@ -544,6 +589,15 @@ apply_direct_changes() {
     return 0
   fi
 
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    # macOS: diff не нужен — бэкенд пересобирает pf-таблицы из файлов политики
+    # (exclude-файлы обёртка уже перезаписала).
+    printf '%s\n' "${ops[@]}" | sudo bash "$CLIENT_SCRIPT" apply-diff \
+      && log "Применено изменений маршрутов: ${#ops[@]}" \
+      || log "WARNING: apply-diff не удался"
+    return 0
+  fi
+
   local table
   table="$(policy_table_direct_runtime)"
 
@@ -614,10 +668,17 @@ apply_force_changes() {
   fi
 
   local rt tdev tip table
-  rt="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s %s %s" "${TUN_DEV:-}" "${SERVER_TUN_IP:-}" "${POLICY_TABLE_DIRECT:-200}"' 2>/dev/null || true)"
+  rt="$(state_var TUN_DEV SERVER_TUN_IP POLICY_TABLE_DIRECT)"
   tdev="${rt%% *}"
   tip="$(awk '{print $2}' <<<"$rt")"
   table="$(awk '{print $3}' <<<"$rt")"
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    # macOS: diff не нужен — бэкенд пересобирает pf-таблицы из файлов политики.
+    printf '%s\n' "${ops[@]}" | sudo bash "$CLIENT_SCRIPT" apply-diff \
+      && log "Применено изменений force-маршрутов: ${#ops[@]}" \
+      || log "WARNING: apply-diff не удался"
+    return 0
+  fi
   if [[ -z "$tdev" || -z "$tip" || -z "$table" ]]; then
     log "Не прочитано состояние туннеля — маршруты подхватятся при следующем 'up'"
     return 0
@@ -649,7 +710,7 @@ apply_force_changes() {
 # иначе env/default. Маршруты include/exclude живут в этой таблице.
 policy_table_direct_runtime() {
   local t=""
-  t="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${POLICY_TABLE_DIRECT:-}"' 2>/dev/null || true)"
+  t="$(state_var POLICY_TABLE_DIRECT)"
   [[ -n "$t" ]] && printf '%s' "$t" || printf '%s' "$POLICY_TABLE_DIRECT"
 }
 
@@ -802,7 +863,7 @@ migrate_legacy_inline() { # src_token_file dst_generated
     echo "# SSHTUN: АВТОГЕНЕРАЦИЯ (мигрировано из старого формата офлайн; данные"
     echo "# могут быть устаревшими — выполните 'sshtun refresh' при появлении сети)."
     echo "# Источники: $(file_sources "$src")"
-    echo "# Обновлено: $(date -Is) (offline-migration)"
+    echo "# Обновлено: $(ts_iso) (offline-migration)"
     printf '%s\n' "$prefixes"
   } > "$dst"
   restore_owner "$dst"
@@ -896,16 +957,37 @@ start_vpn() {
 
 # Маркер SUPERVISED из state работающего туннеля ("1" — под досмотром systemd).
 supervised_marker() {
-  sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${SUPERVISED:-0}"' 2>/dev/null || true
+  state_var SUPERVISED
+}
+
+# Остановка туннеля, поднятого службой досмотра (systemd / launchd).
+supervisor_stop() {
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    log "Туннель под досмотром launchd — останавливаю: launchctl bootout $MACOS_SERVICE"
+    sudo -n launchctl bootout "system/$MACOS_SERVICE" 2>/dev/null \
+      || sudo -n launchctl stop "$MACOS_SERVICE"
+  else
+    log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
+    sudo -n systemctl stop sshtun
+  fi
+}
+
+supervisor_restart() {
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    log "Туннель под досмотром launchd — перезапускаю: launchctl kickstart -k $MACOS_SERVICE"
+    sudo -n launchctl kickstart -k "system/$MACOS_SERVICE"
+  else
+    log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
+    sudo -n systemctl restart sshtun
+  fi
 }
 
 stop_vpn() {
   check_client
-  # Туннель под досмотром systemd (маркер SUPERVISED=1 в state): останавливаем
-  # ЧЕРЕЗ systemctl — иначе Restart=always перезапустил бы его после down.
+  # Туннель под досмотром службы (маркер SUPERVISED=1 в state): останавливаем
+  # ЧЕРЕЗ неё — иначе политика перезапуска вернула бы его после down.
   if [[ "$(supervised_marker)" == "1" ]]; then
-    log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
-    sudo -n systemctl stop sshtun
+    supervisor_stop
     return
   fi
   sudo bash "$CLIENT_SCRIPT" stop
@@ -913,8 +995,7 @@ stop_vpn() {
 
 restart_vpn() {
   if [[ "$(supervised_marker)" == "1" ]]; then
-    log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
-    sudo -n systemctl restart sshtun
+    supervisor_restart
     return
   fi
   stop_vpn || true
@@ -1135,7 +1216,7 @@ write_managed_file() {
     echo "# Источники-ТОКЕНЫ лежат отдельно (~/sshtun/excludes-as.txt, excludes-country.txt)."
     echo "# Источники: $sources"
     echo "# Данные: $datasource"
-    echo "# Обновлено: $(date -Is)"
+    echo "# Обновлено: $(ts_iso)"
     echo "# sshtun-managed-sources: $sources"
     grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | sort -u
   } > "$tmp"
