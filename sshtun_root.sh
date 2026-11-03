@@ -22,12 +22,19 @@ BACKEND="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/sshtun_macos.sh
 STATE_FILE="/var/run/sshtun/state"
 SERVICE_LABEL="com.sshtun.client"
 
+# env.conf (SSH_BIN/BASH_BIN и др.) — пишет install_macos.sh. Без него
+# backend мог бы запуститься системным bash 3.2 (sudo/env), а он падает
+# на "${arr[@]}" под set -u.
+# shellcheck disable=SC1091
+[[ -f "$(dirname -- "$0")/env.conf" ]] && source "$(dirname -- "$0")/env.conf"
+BASH_BIN="${BASH_BIN:-bash}"
+
 case "${1:-}" in
   backend-run)
     shift
     export TUN_NET_A="${TUN_NET_A:-10}"
     export TUN_NET_B="${TUN_NET_B:-250}"
-    exec bash "$BACKEND" "$@"
+    exec "$BASH_BIN" "$BACKEND" "$@"
     ;;
   state-var)
     shift

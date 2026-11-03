@@ -10,18 +10,15 @@ package main
 import (
 	"fmt"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 const (
-	utunControlName  = "com.apple.net.utun_control"
-	utunOptIfName    = 2  // UTUN_OPT_IFNAME
-	sysProtoControl  = 2  // SYSPROTO_CONTROL (не сгенерирован в x/sys/unix)
-	afSystem         = 32 // AF_SYSTEM
-	// CTLIOCGINFO: _IOWR('N', 3, struct ctl_info)
-	ctlIOCInfo = (0x40000000 | 0x1000000) | ('N' << 8) | 3
+	utunControlName = "com.apple.net.utun_control"
+	utunOptIfName   = 2  // UTUN_OPT_IFNAME
+	sysProtoControl = 2  // SYSPROTO_CONTROL (не сгенерирован в x/sys/unix)
+	afSystem        = 32 // AF_SYSTEM
 )
 
 type utunDevice struct {
@@ -39,19 +36,9 @@ func createUtun() (*utunDevice, error) {
 	}
 	var ctlInfo unix.CtlInfo
 	copy(ctlInfo.Name[:], utunControlName)
-	ctlLen := uint32(unsafe.Sizeof(ctlInfo))
-	_, _, errno := unix.Syscall6(
-		unix.SYS_GETSOCKOPT,
-		uintptr(fd),
-		uintptr(sysProtoControl),
-		uintptr(ctlIOCInfo),
-		uintptr(unsafe.Pointer(&ctlInfo)),
-		uintptr(unsafe.Pointer(&ctlLen)),
-		0,
-	)
-	if errno != 0 {
+	if err := unix.IoctlCtlInfo(fd, &ctlInfo); err != nil {
 		_ = unix.Close(fd)
-		return nil, fmt.Errorf("CTLIOCGINFO %q: %v", utunControlName, errno)
+		return nil, fmt.Errorf("CTLIOCGINFO %q: %w", utunControlName, err)
 	}
 
 	units := []uint32{4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
