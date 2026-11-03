@@ -85,13 +85,15 @@ SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-65523}"
 SSH_USER="${SSH_USER:-sshvpn}"
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/sshtun_ed25519}"
-TUN_START="${TUN_START:-200}"
-TUN_END="${TUN_END:-300}"
+TUN_START="${TUN_START:-100}"
+TUN_END="${TUN_END:-200}"
 MTU="${MTU:-1400}"
 # Адресация туннельной пары: клиент вычисляет свою/серверную IP из номера
 # tun (как и серверный apply-network.sh). Дефолт 10.250/16 должен совпадать
 # с серверным TUN_NET_A/TUN_NET_B; сервер с другой адресацией (например,
 # второй сервер в 10.251/16) задаётся в профиле (--net-a/--net-b).
+# Диапазон tun по умолчанию 100..200 — намеренно <=255: macOS выделяет
+# utun только в пределах 0..255, большие номера «Tunnel device open failed».
 TUN_NET_A="${TUN_NET_A:-10}"
 TUN_NET_B="${TUN_NET_B:-250}"
 

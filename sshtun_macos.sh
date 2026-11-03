@@ -34,8 +34,9 @@ IFS=$'\n\t'
 
 SSH_USER="${SSH_USER:-sshvpn}"
 SSH_PORT="${SSH_PORT:-65523}"
-TUN_START="${TUN_START:-200}"
-TUN_END="${TUN_END:-300}"
+# Диапазон 100..200 намеренно <=255: macOS выделяет utun только 0..255.
+TUN_START="${TUN_START:-100}"
+TUN_END="${TUN_END:-200}"
 TUN_MTU="${TUN_MTU:-1400}"
 
 TUN_NET_A="${TUN_NET_A:-10}"

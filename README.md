@@ -2,7 +2,7 @@
 
 Проект реализует L3-туннель поверх обычного SSH с использованием `ssh -w` / OpenSSH TUN. Сервер поднимает пул TUN-интерфейсов, клиенты случайно выбирают свободный `tunN`, подключаются по SSH и направляют трафик через зашифрованный SSH-канал.
 
-Основная идея MVP: использовать стандартный OpenSSH вместо отдельного VPN-сервера. На сервере достаточно отдельного `sshd`-инстанса с `PermitTunnel point-to-point`, подготовленного пула `tun200..tun300` и NAT. На клиентах используются Linux shell-клиент или Windows Go/Wintun-клиент.
+Основная идея MVP: использовать стандартный OpenSSH вместо отдельного VPN-сервера. На сервере достаточно отдельного `sshd`-инстанса с `PermitTunnel point-to-point`, подготовленного пула `tun100..tun200` и NAT. На клиентах используются Linux shell-клиент или Windows Go/Wintun-клиент.
 
 ## Схема работы
 
@@ -23,12 +23,12 @@ sshtun-pool-sshd на сервере
 Internet / routed networks
 ```
 
-По умолчанию используется пул `tun200..tun300` и адресация внутри `10.250.0.0/16` (пул выровнен с дефолтным клиентским диапазоном `TUN_START..TUN_END` — клиент просит у сервера устройство с тем же номером):
+По умолчанию используется пул `tun100..tun200` и адресация внутри `10.250.0.0/16` (пул выровнен с дефолтным клиентским диапазоном `TUN_START..TUN_END` — клиент просит у сервера устройство с тем же номером):
 
 ```text
-tun200 -> server 10.250.0.1,   client 10.250.0.2
-tun201 -> server 10.250.0.5,   client 10.250.0.6
-tun300 -> server 10.250.1.145, client 10.250.1.146
+tun100 -> server 10.250.0.1,   client 10.250.0.2
+tun101 -> server 10.250.0.5,   client 10.250.0.6
+tun200 -> server 10.250.1.145, client 10.250.1.146
 ```
 
 Адреса выделяются парами по схеме `/30`-блоков. Клиенту не нужно заранее знать свой IP: он вычисляется из номера выбранного `tunN`.
@@ -79,7 +79,7 @@ tun300 -> server 10.250.1.145, client 10.250.1.146
 - создаёт service `sshtun-pool-network.service` для подготовки TUN-пула и NAT;
 - генерирует отдельный host key для SSH-TUN сервиса;
 - включает `net.ipv4.ip_forward=1`;
-- создаёт `tun200..tun300` (диапазон настраивается через `TUN_NUM_START` / `TUN_POOL_SIZE`; должен накрывать клиентский `TUN_START..TUN_END`);
+- создаёт `tun100..tun200` (диапазон настраивается через `TUN_NUM_START` / `TUN_POOL_SIZE`; должен накрывать клиентский `TUN_START..TUN_END`);
 - добавляет минимальные правила NAT/forwarding через WAN-интерфейс;
 - директивы, которых нет в старом OpenSSH (`PermitListen none`, `PermitOpen none`), добавляет в graceful-режиме — установка не падает на OpenSSH < 7.8, например на Ubuntu 18.04.
 
@@ -246,7 +246,7 @@ sudo bash install_server.sh
 ```text
 user:        sshvpn
 port:        65523
-tun pool:    tun200..tun300
+tun pool:    tun100..tun200
 network:     10.250.0.0/16
 mtu:         1400
 base dir:    /opt/sshtun_pool
@@ -268,7 +268,7 @@ ss -lntp | grep 65523
 Проверка TUN-пула:
 
 ```bash
-ip addr show tun200
+ip addr show tun100
 ip addr show tun101
 ```
 
@@ -606,7 +606,7 @@ systemctl status sshtun-pool-network.service --no-pager
 Linux:
 
 ```bash
-ip addr show tun200
+ip addr show tun100
 ip route
 curl -4 ifconfig.me
 sudo bash sshtun_pool_client.sh status
@@ -624,7 +624,7 @@ ipconfig /all
 На сервере:
 
 ```bash
-ip addr show tun200
+ip addr show tun100
 iptables -t nat -S | grep 10.250
 journalctl -u sshtun-pool-sshd.service -f
 ```
@@ -735,7 +735,7 @@ Cleanup удаляет только управляемые интерфейсы/
 
 ```bash
 LISTEN_PORT=65523 \
-TUN_NUM_START=200 \
+TUN_NUM_START=100 \
 TUN_POOL_SIZE=101 \
 TUN_MTU=1400 \
 BASE_DIR=/opt/sshtun_pool \
