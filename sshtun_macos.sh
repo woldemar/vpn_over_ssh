@@ -398,8 +398,9 @@ start_vpn() {
 
   if [[ -n "${TUN_GO_BIN:-}" ]]; then
     log "data-plane: $TUN_GO_BIN (tun@openssh.com, userspace)"
+    : > "$SSH_LOG"
     "$TUN_GO_BIN" \
-        --host "$HOST" --port "$SERVER_PORT" --user "$SSH_USER" \
+        --host "$HOST" --port "$SSH_PORT" --user "$SSH_USER" \
         --key "$KEY_FILE" --remote-unit "$TUN_NUM" --mtu "$TUN_MTU" \
         --known-hosts "$KNOWN_HOSTS_FILE" \
         >"$SSH_LOG" 2>&1 &
