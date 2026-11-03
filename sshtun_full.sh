@@ -109,10 +109,9 @@ EXCLUDES_DIR="${EXCLUDES_DIR:-$HOME/sshtun}"
 # его не замечают) — 'server use <name>' атомарно устанавливает профиль в него.
 SERVER_CONF="$EXCLUDES_DIR/server.conf"
 SERVERS_DIR="$EXCLUDES_DIR/servers"
-# SERVER_HOST из локального конфиг-файла (env имеет приоритет).
-if [[ -z "$SERVER_HOST" && -f "$SERVER_CONF" ]]; then
-  SERVER_HOST="$(sed -n 's/^SERVER_HOST=//p' "$SERVER_CONF" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
-fi
+# Активный профиль (server.conf, в т.ч. старый ручной) читается после
+# определения функций — см. reload_server_conf вызов перед dispatch: env
+# побеждает, из файла подтягиваются все параметры сервера.
 BASE_EXCLUDES="$EXCLUDES_DIR/excludes.txt"
 CUSTOM_EXCLUDES="$EXCLUDES_DIR/excludes-custom.txt"
 AS_EXCLUDES="$EXCLUDES_DIR/excludes-as.txt"
@@ -1300,6 +1299,11 @@ list_policy() {
 legacy_hint() {
   log "Подсказка: синтаксис устарел — используйте: sshtun $1"
 }
+
+# Активный профиль: применить server.conf (env побеждает файл).
+# До dispatch — чтобы ВСЕ команды (up/status/list/...) видели параметры
+# сервера из активного профиля, а не только 'server use'.
+reload_server_conf
 
 cmd="${1:-}"
 case "$cmd" in
