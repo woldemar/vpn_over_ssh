@@ -33,7 +33,10 @@ INSTALL_USER="${SUDO_USER:-$USER}"
 INSTALL_USER_HOME="$(eval echo "~$INSTALL_USER" 2>/dev/null || echo "$HOME")"
 # bash >= 4.3 ищем: явный выбор, brew (Intel/ARM), локальная сборка
 # ~/sshtun-tools (ставится скриптом prepare_macos.sh, если нет brew).
-BASH_BIN_CANDIDATES="${BASH_BIN:-} /usr/local/bin/bash /opt/homebrew/bin/bash $INSTALL_USER_HOME/sshtun-tools/bin/bash"
+# Массив, а не строка: в скрипте IFS без пробела, word-splitting не сработал бы.
+BASH_BIN_CANDIDATES=()
+[[ -n "${BASH_BIN:-}" ]] && BASH_BIN_CANDIDATES+=("$BASH_BIN")
+BASH_BIN_CANDIDATES+=(/usr/local/bin/bash /opt/homebrew/bin/bash "$INSTALL_USER_HOME/sshtun-tools/bin/bash")
 
 log(){ echo "[install] $*"; }
 die(){ echo "[install][ERROR] $*" >&2; exit 1; }
@@ -49,7 +52,7 @@ bash_version_ok() { # path -> 0 если >= 4.3
 
 detect_bash() {
   local c="" found=""
-  for c in $BASH_BIN_CANDIDATES; do
+  for c in "${BASH_BIN_CANDIDATES[@]}"; do
     if bash_version_ok "$c"; then found="$c"; break; fi
   done
   if [[ -z "$found" ]]; then
