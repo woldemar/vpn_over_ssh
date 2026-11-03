@@ -227,7 +227,12 @@ pf_ensure_enabled() {
 }
 
 pf_load_anchor() {
-  [[ -f "$PF_ANCHOR_FRAME" ]] || die "Нет $PF_ANCHOR_FRAME — запустите install_macos.sh"
+  [[ -f "$PF_ANCHOR_FRAME" ]] || die "Нет $PF_ANCHOR_FILE — запустите install_macos.sh"
+  # anchor должен существовать в main ruleset: если pf.conf поправили при
+  # установке, а main ruleset ещё не перечитывали — перечитываем целиком.
+  if ! pfctl -s anchors 2>/dev/null | grep -qx "$PF_ANCHOR_NAME"; then
+    pfctl -f /etc/pf.conf >/dev/null 2>&1 || true
+  fi
   # таблицы должны существовать до загрузки правил
   : > "$TBL_EXCLUDES" 2>/dev/null || true
   pf_write_tables
@@ -470,12 +475,15 @@ start_vpn() {
   pf_load_anchor
   log "pf anchor $PF_ANCHOR_NAME загружен ($TUN_DEV -> $SERVER_TUN_IP)"
 
+  # state пишем ДО dns_save_and_set: та ДОПИСЫВАЕТ DNS_* в конец файла,
+  # а write_state перезаписывает файл с нуля — иначе бэкап DNS теряется.
+  START_OK="1"
+  write_state
+
   if [[ "$SET_DNS" == "1" ]]; then
     dns_save_and_set
   fi
 
-  START_OK="1"
-  write_state
   log "Connected"
 
   if [[ "$FOREGROUND" == "1" ]]; then
@@ -599,9 +607,9 @@ doctor_vpn() {
 cleanup_vpn() {
   need_root
   log "Cleaning up leftovers"
-  # убить ssh от старых запусков
+  # убить data-plane/ssh от старых запусков
   local pids=""
-  pids="$(pgrep -f "sshtun.*-w " 2>/dev/null || true)"
+  pids="$(pgrep -f "sshtun-macos-tun|sshtun.*-w " 2>/dev/null || true)"
   local p=""
   for p in $pids; do
     [[ "$p" == "$$" ]] && continue
