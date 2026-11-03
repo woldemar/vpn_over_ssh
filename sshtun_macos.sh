@@ -34,9 +34,11 @@ IFS=$'\n\t'
 
 SSH_USER="${SSH_USER:-sshvpn}"
 SSH_PORT="${SSH_PORT:-65523}"
-# Диапазон 100..200 намеренно <=255: macOS выделяет utun только 0..255.
-TUN_START="${TUN_START:-100}"
-TUN_END="${TUN_END:-200}"
+# Диапазон 200..250 — осознанный компромисс: 0..~15 занимает система macOS,
+# 100..199 может занимать NetworkManager на Linux-хостах, macOS не умеет
+# utun > 255 («Tunnel device open failed»).
+TUN_START="${TUN_START:-200}"
+TUN_END="${TUN_END:-250}"
 TUN_MTU="${TUN_MTU:-1400}"
 
 TUN_NET_A="${TUN_NET_A:-10}"
