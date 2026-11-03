@@ -380,6 +380,7 @@ sshtun server list
 
 ```bash
 sshtun server use backup      # туннель переподнимется на другом сервере
+sshtun backup                 # то же самое — сокращение от 'server use'
 sshtun status                 # первая строка: "Профиль: backup (<адрес>)"
 sshtun server list            # '*' — у backup
 sshtun server use backup      # идемпотентно: "уже активен", рестарта нет
