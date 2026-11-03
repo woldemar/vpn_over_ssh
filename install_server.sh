@@ -37,14 +37,23 @@ NETWORK_SERVICE_NAME="${NETWORK_SERVICE_NAME:-sshtun-pool-network}"
 SYSTEM_USER="${SYSTEM_USER:-sshvpn}"
 LISTEN_PORT="${LISTEN_PORT:-65523}"
 
-TUN_NUM_START="${TUN_NUM_START:-100}"
+# Пул tun-устройств СЕРВЕРА. Дефолт выровнен с дефолтным диапазоном
+# клиента (sshtun_full.sh: TUN_START=200, TUN_END=300): клиент просит у
+# сервера устройство с ТЕМ ЖЕ номером (-w N:N), и оно обязано существовать
+# на сервере заранее (sshd от пользователя sshvpn не может создать tun
+# динамически). Если меняете диапазон клиента — меняйте и этот пул так,
+# чтобы он его накрывал.
+TUN_NUM_START="${TUN_NUM_START:-200}"
 TUN_POOL_SIZE="${TUN_POOL_SIZE:-101}"
 TUN_PREFIX="${TUN_PREFIX:-tun}"
 TUN_MTU="${TUN_MTU:-1400}"
 
 TUN_NET_A="${TUN_NET_A:-10}"
 TUN_NET_B="${TUN_NET_B:-250}"
-TUN_POOL_CIDR="${TUN_POOL_CIDR:-10.250.0.0/16}"
+# Дефолт CIDR выводится из NET_A/NET_B: при смене адресации сервера
+# (например, второй сервер в 10.251.0.0/16, чтобы не пересекаться
+# с первым) NAT подхватывается автоматически.
+TUN_POOL_CIDR="${TUN_POOL_CIDR:-$TUN_NET_A.$TUN_NET_B.0.0/16}"
 
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
 NOLOGIN_BIN="${NOLOGIN_BIN:-/usr/sbin/nologin}"
