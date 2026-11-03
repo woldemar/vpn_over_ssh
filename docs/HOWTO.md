@@ -361,8 +361,13 @@ cp -a ~/sshtun ~/sshtun.bak.$(date +%Y%m%d-%H%M)   # бэкап (server.conf б�
 
 ```bash
 # второй сервер (реальный адрес вместо плейсхолдера):
+# --tun-start/--tun-end — диапазон tun этого сервера (на сервере должен быть
+# создан такой же пул: TUN_NUM_START/TUN_POOL_SIZE при install_server.sh);
+# --net-a/--net-b — его туннельная адресация (например 10.251/16, чтобы не
+# пересекаться с первым сервером).
 sshtun server add backup 203.0.113.20 --port 65523 --user sshvpn \
-  --key ~/.ssh/sshtun_ed25519 -- "запасной"
+  --key ~/.ssh/sshtun_ed25519 --tun-start 300 --tun-end 400 \
+  --net-a 10 --net-b 251 -- "запасной"
 # миграция текущего server.conf в профиль (адрес возьмите из ~/sshtun/server.conf):
 sshtun server add main 203.0.113.10 -- "основной"
 sshtun server list

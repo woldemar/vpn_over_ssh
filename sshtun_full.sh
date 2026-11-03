@@ -46,7 +46,8 @@ IFS=$'\n\t'
 #   list                показать эффективную маршрутную политику
 #   server list         список профилей серверов ('*' — активный)
 #   server add NAME HOST [--port N] [--user U] [--key FILE]
-#                       [--tun-start N] [--tun-end N] [--mtu N] [-- комментарий]
+#                       [--tun-start N] [--tun-end N] [--mtu N]
+#                       [--net-a A] [--net-b B] [-- комментарий]
 #   server use NAME     переключиться на профиль (переподнимет туннель)
 #   server del NAME     удалить профиль (активный удалить нельзя)
 #
@@ -75,6 +76,8 @@ KEY_FILE_FROM_ENV="${KEY_FILE:-}"
 TUN_START_FROM_ENV="${TUN_START:-}"
 TUN_END_FROM_ENV="${TUN_END:-}"
 MTU_FROM_ENV="${MTU:-}"
+TUN_NET_A_FROM_ENV="${TUN_NET_A:-}"
+TUN_NET_B_FROM_ENV="${TUN_NET_B:-}"
 SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-65523}"
 SSH_USER="${SSH_USER:-sshvpn}"
@@ -82,6 +85,12 @@ KEY_FILE="${KEY_FILE:-$HOME/.ssh/sshtun_ed25519}"
 TUN_START="${TUN_START:-200}"
 TUN_END="${TUN_END:-300}"
 MTU="${MTU:-1400}"
+# Адресация туннельной пары: клиент вычисляет свою/серверную IP из номера
+# tun (как и серверный apply-network.sh). Дефолт 10.250/16 должен совпадать
+# с серверным TUN_NET_A/TUN_NET_B; сервер с другой адресацией (например,
+# второй сервер в 10.251/16) задаётся в профиле (--net-a/--net-b).
+TUN_NET_A="${TUN_NET_A:-10}"
+TUN_NET_B="${TUN_NET_B:-250}"
 
 # Директория скрипта с разрешением симлинков: обёртка может быть
 # установлена как symlink в /usr/local/bin/sshtun -> /opt/sshtun_client/.
@@ -154,8 +163,11 @@ usage() {
   $0 list               показать маршрутную политику
   $0 server list        список профилей серверов ('*' — активный)
   $0 server add NAME HOST [--port N] [--user U] [--key FILE]
-                        [--tun-start N] [--tun-end N] [--mtu N] [-- комментарий]
+                        [--tun-start N] [--tun-end N] [--mtu N]
+                        [--net-a A] [--net-b B] [-- комментарий]
                         добавить профиль сервера
+                        (--net-a/--net-b — адресация туннельной пары,
+                        должна совпадать с серверными TUN_NET_A/TUN_NET_B)
   $0 server use NAME    переключиться на профиль (туннель переподнимется,
                         если работает; иначе применится при следующем up)
   $0 server del NAME    удалить профиль (активный удалить нельзя)
@@ -279,6 +291,10 @@ reload_server_conf() {
   [[ -n "$TUN_END" ]] || TUN_END=300
   MTU="${MTU_FROM_ENV:-$(conf_key "$SERVER_CONF" MTU)}"
   [[ -n "$MTU" ]] || MTU=1400
+  TUN_NET_A="${TUN_NET_A_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_NET_A)}"
+  [[ -n "$TUN_NET_A" ]] || TUN_NET_A=10
+  TUN_NET_B="${TUN_NET_B_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_NET_B)}"
+  [[ -n "$TUN_NET_B" ]] || TUN_NET_B=250
 }
 
 # Имя активного профиля — маркер '# sshtun-profile: NAME', который 'server use'
@@ -365,6 +381,7 @@ server_add() {
   shift 2  # name и host гарантированно есть (проверка выше)
   local port="$SERVER_PORT" user="$SSH_USER" key="$KEY_FILE" mtu="$MTU"
   local tstart="$TUN_START" tend="$TUN_END" comment="" a=""
+  local net_a="$TUN_NET_A" net_b="$TUN_NET_B"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --port)      port="${2:-}"; shift 2 ;;
@@ -373,6 +390,8 @@ server_add() {
       --tun-start) tstart="${2:-}"; shift 2 ;;
       --tun-end)   tend="${2:-}"; shift 2 ;;
       --mtu)       mtu="${2:-}"; shift 2 ;;
+      --net-a)     net_a="${2:-}"; shift 2 ;;
+      --net-b)     net_b="${2:-}"; shift 2 ;;
       --)          shift; comment=""
                    for a in "$@"; do comment+="${comment:+ }$a"; done
                    break ;;
@@ -396,6 +415,10 @@ KEY_FILE=$key
 TUN_START=$tstart
 TUN_END=$tend
 MTU=$mtu
+# Адресация туннельной пары — должна совпадать с серверными
+# TUN_NET_A/TUN_NET_B (у второго сервера своя, чтобы не пересекаться).
+TUN_NET_A=$net_a
+TUN_NET_B=$net_b
 EOFPROFILE
   restore_owner "$dest"
   log "Профиль '$name' создан: $dest"
@@ -747,11 +770,14 @@ start_vpn() {
     # а не получает SIGKILL посреди cleanup (было: t201 чист, t200 — нет).
     # Падение любого звена всё равно видно systemd как смерть main -> рестарт
     # (Restart=always), ручной down идёт через 'systemctl stop' (маркер
-    # SUPERVISED=1 в state).
+    # SUPERVISED=1 в state). TUN_NET_* пробрасываем через env: sudo по
+    # умолчанию сбрасывает окружение, а клиент считает IP-пару из него.
     args+=(--foreground)
-    exec sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+    exec sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+      bash "$CLIENT_SCRIPT" start "${args[@]}"
   fi
-  sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+  sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+    bash "$CLIENT_SCRIPT" start "${args[@]}"
 }
 
 # Маркер SUPERVISED из state работающего туннеля ("1" — под досмотром systemd).
