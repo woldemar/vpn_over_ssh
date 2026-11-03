@@ -65,10 +65,16 @@ IFS=$'\n\t'
 # SERVER_HOST намеренно НЕ имеет дефолта в коде: реальный адрес сервера
 # задаётся локально — через env SERVER_HOST или файл ~/sshtun/server.conf
 # (создаётся установщиком из шаблона, в репозиторий не коммитится).
-# Адрес, заданный через env (имеет приоритет над любыми файлами) — запоминаем
-# до чтения server.conf, чтобы 'server use' мог предупредить, что env-маршрут
-# перекрывает переключение профилей.
+# Адрес и параметры, заданные через env (имеют приоритет над любыми
+# файлами) — запоминаем до чтения server.conf, чтобы 'server use' мог
+# перечитать конфиг свежим и при этом не перекрыть явный env.
 SERVER_HOST_FROM_ENV="${SERVER_HOST:-}"
+SERVER_PORT_FROM_ENV="${SERVER_PORT:-}"
+SSH_USER_FROM_ENV="${SSH_USER:-}"
+KEY_FILE_FROM_ENV="${KEY_FILE:-}"
+TUN_START_FROM_ENV="${TUN_START:-}"
+TUN_END_FROM_ENV="${TUN_END:-}"
+MTU_FROM_ENV="${MTU:-}"
 SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-65523}"
 SSH_USER="${SSH_USER:-sshvpn}"
@@ -254,6 +260,27 @@ conf_key() { # file key
   printf '%s' "$out"
 }
 
+# Перечитать параметры сервера из активного server.conf. Нужна после
+# 'server use': переменные скрипта прочитаны на старте, а профиль только
+# что сменился. env (сохранён в *_FROM_ENV на старте) побеждает файл;
+# отсутствующие в файле ключи оставляем дефолтными.
+reload_server_conf() {
+  [[ -f "$SERVER_CONF" ]] || return 0
+  SERVER_HOST="${SERVER_HOST_FROM_ENV:-$(conf_key "$SERVER_CONF" SERVER_HOST)}"
+  SERVER_PORT="${SERVER_PORT_FROM_ENV:-$(conf_key "$SERVER_CONF" SERVER_PORT)}"
+  [[ -n "$SERVER_PORT" ]] || SERVER_PORT=65523
+  SSH_USER="${SSH_USER_FROM_ENV:-$(conf_key "$SERVER_CONF" SSH_USER)}"
+  [[ -n "$SSH_USER" ]] || SSH_USER=sshvpn
+  KEY_FILE="${KEY_FILE_FROM_ENV:-$(conf_key "$SERVER_CONF" KEY_FILE)}"
+  [[ -n "$KEY_FILE" ]] || KEY_FILE="$HOME/.ssh/sshtun_ed25519"
+  TUN_START="${TUN_START_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_START)}"
+  [[ -n "$TUN_START" ]] || TUN_START=200
+  TUN_END="${TUN_END_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_END)}"
+  [[ -n "$TUN_END" ]] || TUN_END=300
+  MTU="${MTU_FROM_ENV:-$(conf_key "$SERVER_CONF" MTU)}"
+  [[ -n "$MTU" ]] || MTU=1400
+}
+
 # Имя активного профиля — маркер '# sshtun-profile: NAME', который 'server use'
 # пишет в server.conf. Пусто — server.conf сделан/правлен вручную.
 active_profile() {
@@ -401,7 +428,8 @@ server_use() {
   [[ -z "$SERVER_HOST_FROM_ENV" ]] \
     || log "ВНИМАНИЕ: SERVER_HOST задан через env — файл/профиль им перекрывается"
   activate_profile "$name"
-  log "Переключено на '$name' ($host)"
+  reload_server_conf
+  log "Переключено на '$name' ($SERVER_HOST)"
   if tun_is_running; then
     log "Туннель работает — переподнимаю на новом сервере"
     restart_vpn
