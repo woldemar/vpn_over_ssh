@@ -39,13 +39,15 @@ func createUtun() (*utunDevice, error) {
 	}
 	var ctlInfo unix.CtlInfo
 	copy(ctlInfo.Name[:], utunControlName)
+	ctlLen := uint32(unsafe.Sizeof(ctlInfo))
 	_, _, errno := unix.Syscall6(
 		unix.SYS_GETSOCKOPT,
 		uintptr(fd),
 		uintptr(sysProtoControl),
 		uintptr(ctlIOCInfo),
 		uintptr(unsafe.Pointer(&ctlInfo)),
-		0, 0,
+		uintptr(unsafe.Pointer(&ctlLen)),
+		0,
 	)
 	if errno != 0 {
 		_ = unix.Close(fd)

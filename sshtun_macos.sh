@@ -389,10 +389,11 @@ start_vpn() {
   if [[ -z "${TUN_GO_BIN:-}" ]]; then
     local _uh=""
     _uh="$(eval echo "~${SUDO_USER:-$USER}" 2>/dev/null || true)"
-    if [[ -x "$SCRIPT_DIR_MACOS/sshtun-macos-tun" ]]; then
-      TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun-macos-tun"
-    elif [[ -n "$_uh" && -x "$_uh/sshtun-tools/bin/sshtun-macos-tun" ]]; then
+    # Пользовательская сборка в приоритете: обновление бинаря без root.
+    if [[ -n "$_uh" && -x "$_uh/sshtun-tools/bin/sshtun-macos-tun" ]]; then
       TUN_GO_BIN="$_uh/sshtun-tools/bin/sshtun-macos-tun"
+    elif [[ -x "$SCRIPT_DIR_MACOS/sshtun-macos-tun" ]]; then
+      TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun-macos-tun"
     fi
   fi
 
