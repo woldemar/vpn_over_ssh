@@ -124,6 +124,8 @@ if [[ "$UNAME_S" == "Darwin" ]]; then
 else
   CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
 fi
+# env.conf (SSH_BIN и др.) — пишет install_macos.sh. shellcheck disable=SC1091
+[[ -f "$SCRIPT_DIR/env.conf" ]] && source "$SCRIPT_DIR/env.conf"
 
 EXCLUDES_DIR="${EXCLUDES_DIR:-$HOME/sshtun}"
 # Профили серверов: библиотека в servers/*.conf + активный server.conf.

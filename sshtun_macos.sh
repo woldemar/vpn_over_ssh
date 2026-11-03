@@ -44,6 +44,15 @@ TUN_MTU="${TUN_MTU:-1400}"
 TUN_NET_A="${TUN_NET_A:-10}"
 TUN_NET_B="${TUN_NET_B:-250}"
 
+# SSH-бинарник: Apple ssh НЕ умеет -w/utun («Tunnel device open failed») —
+# нужен portable OpenSSH (brew или сборка prepare_macos.sh). Путь к нему
+# установщик пишет в env.conf рядом со скриптом (конфиг source'ится и
+# напрямую, и через root-хелпер, где $HOME указывает в /var/root).
+SCRIPT_DIR_MACOS="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+# shellcheck disable=SC1091
+[[ -f "$SCRIPT_DIR_MACOS/env.conf" ]] && source "$SCRIPT_DIR_MACOS/env.conf"
+SSH_BIN="${SSH_BIN:-ssh}"
+
 STATE_DIR="${STATE_DIR:-/var/run/sshtun}"
 STATE_FILE="$STATE_DIR/state"
 SSH_LOG="$STATE_DIR/ssh.log"
@@ -353,6 +362,7 @@ start_vpn() {
 
   [[ -n "$HOST" ]] || die "--host не задан"
   [[ -f "$KEY_FILE" ]] || die "ключ не найден: $KEY_FILE"
+  log "SSH: $SSH_BIN ($("$SSH_BIN" -V 2>&1 | head -n1 || true))"
 
   detect_default_route
   log "Default route: via $DEFAULT_GW dev $DEFAULT_DEV"
@@ -386,7 +396,7 @@ start_vpn() {
   # SSH: BatchMode (ключ без passphrase), KeepAlive — как на Linux.
   # RemoteCommand запрещён на сервере, -N — просто держим туннель.
   # -w local:remote — локальный utun4..15 (macOS), удалённый tunN из пула.
-  ssh -i "$KEY_FILE" -p "$SSH_PORT" -l "$SSH_USER" \
+  "$SSH_BIN" -i "$KEY_FILE" -p "$SSH_PORT" -l "$SSH_USER" \
       -w "$local_utun:$TUN_NUM" \
       -o Tunnel=point-to-point \
       -o ExitOnForwardFailure=yes \

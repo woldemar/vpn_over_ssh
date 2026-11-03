@@ -23,13 +23,18 @@ full-tunnel через SSH (ssh -w / utun), исключения (exclude), пр
 ## 0. Требования
 
 - macOS Sonoma/Sequoia (Intel).
-- **bash >= 4.3** — системный bash 3.2 macOS не подходит. Варианты:
-  - `brew install bash` (если brew установлен), либо
-  - `bash prepare_macos.sh` — соберёт bash в `~/sshtun-tools` из исходников
-    (нужен Xcode CLT; без brew и без root).
+- **bash >= 4.3** и **ssh с поддержкой `-w`/utun** — системный bash 3.2 и
+  Apple ssh (`/usr/bin/ssh`) НЕ подходят: bash 3.2 не умеет nameref/assoc-
+  arrays, а Apple ssh падает «Tunnel device open failed». Сборка без brew,
+  без root (нужен Xcode CLT):
+  ```bash
+  bash prepare_macos.sh   # bash + LibreSSL + OpenSSH -> ~/sshtun-tools
+  ```
+  (если brew установлен, подойдут `brew install bash openssh`).
 - `xcode-select --install` (python3/dig — из CLT).
-- Установщик сам найдёт подходящий bash (brew → `~/sshtun-tools`) и сделает
-  шим `/usr/local/bin/sshtun`, жёстко привязанный к нему.
+- Установщик сам найдёт подходящие bash/ssh и запишет путь к ssh в
+  `/opt/sshtun_client/env.conf`; шим `/usr/local/bin/sshtun` жёстко
+  привязан к нужному bash.
 
 ## 1. Установка
 
