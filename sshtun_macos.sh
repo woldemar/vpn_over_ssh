@@ -381,6 +381,47 @@ start_vpn() {
   mkdir -p "$STATE_DIR" "$PF_RUNTIME_DIR"
   chmod 700 "$STATE_DIR" 2>/dev/null || true
 
+  # Дата-плейн: Go-бинарь (протокол tun@openssh.com в userspace — замена
+  # «ssh -w», которого на macOS нет: ни Apple, ни portable OpenSSH не умеют
+  # utun). Поиск: env.conf/переменная → каталог скрипта → ~/sshtun-tools
+  # пользователя (sudo сохраняет SUDO_USER; под launchd без SUDO_USER
+  # работает env.conf).
+  if [[ -z "${TUN_GO_BIN:-}" ]]; then
+    local _uh=""
+    _uh="$(eval echo "~${SUDO_USER:-$USER}" 2>/dev/null || true)"
+    if [[ -x "$SCRIPT_DIR_MACOS/sshtun-macos-tun" ]]; then
+      TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun-macos-tun"
+    elif [[ -n "$_uh" && -x "$_uh/sshtun-tools/bin/sshtun-macos-tun" ]]; then
+      TUN_GO_BIN="$_uh/sshtun-tools/bin/sshtun-macos-tun"
+    fi
+  fi
+
+  if [[ -n "${TUN_GO_BIN:-}" ]]; then
+    log "data-plane: $TUN_GO_BIN (tun@openssh.com, userspace)"
+    "$TUN_GO_BIN" \
+        --host "$HOST" --port "$SERVER_PORT" --user "$SSH_USER" \
+        --key "$KEY_FILE" --remote-unit "$TUN_NUM" --mtu "$TUN_MTU" \
+        --known-hosts "$KNOWN_HOSTS_FILE" \
+        >"$SSH_LOG" 2>&1 &
+    SSH_PID=$!
+    printf '%s\n' "$SSH_PID" > "$STATE_DIR/ssh.pid"
+    # ждём маркер UTUN_READY (канал открыт); смерть процесса — ранний выход
+    TUN_DEV=""
+    local i=0
+    for ((i=0; i<240; i++)); do
+      if ! kill -0 "$SSH_PID" 2>/dev/null; then break; fi
+      TUN_DEV="$(sed -n 's/^UTUN_READY dev=\([^[:space:]]*\).*/\1/p' "$SSH_LOG" 2>/dev/null | tail -n1)"
+      [[ -n "$TUN_DEV" ]] && break
+      sleep 0.25
+    done
+    if [[ -z "$TUN_DEV" ]]; then
+      wait "$SSH_PID" 2>/dev/null || true
+      cp "$SSH_LOG" "$SSH_LAST_LOG" 2>/dev/null || true
+      die "туннель не поднялся; лог: $(tail -n 8 "$SSH_LOG" 2>/dev/null | tr '\n' ' ')"
+    fi
+  else
+    log "data-plane: $SSH_BIN -w (встроенный ssh; на macOS обычно не работает — соберите sshtun_macos_client)"
+
   local before_utuns
   before_utuns="$(mktemp)"
   utun_list > "$before_utuns"
@@ -416,6 +457,7 @@ start_vpn() {
     wait "$SSH_PID" 2>/dev/null || true
     cp "$SSH_LOG" "$SSH_LAST_LOG" 2>/dev/null || true
     die "utun не появился; ssh log: $(tail -n 5 "$SSH_LOG" 2>/dev/null | tr '\n' ' ')"
+  fi
   fi
 
   # адреса point-to-point + mtu
