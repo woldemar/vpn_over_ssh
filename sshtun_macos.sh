@@ -205,14 +205,16 @@ pf_write_anchor() { # правила с подставленным utun/peer
     printf 'table <sshtun_bypass> persist file "%s"\n' "$TBL_BYPASS"
     # порядок = семантика: include (равный префикс побеждает), exclude (LPM),
     # bypass (сервер/шлюз/link-local), multicast, IPv6-block, catch-all в tun.
-    printf 'pass out quick inet from any to <sshtun_includes> route-to (%s %s)\n' "$TUN_DEV" "$SERVER_TUN_IP"
+    # Синтаксис pf строг: route-to — ДО proto/from/to; quick — после
+    # направления; block: "block drop out quick inet6 all".
+    printf 'pass out quick route-to (%s %s) inet from any to <sshtun_includes>\n' "$TUN_DEV" "$SERVER_TUN_IP"
     printf 'pass out quick inet from any to <sshtun_excludes>\n'
     printf 'pass out quick inet from any to <sshtun_bypass>\n'
     printf 'pass out quick inet from any to 224.0.0.0/4\n'
     if [[ "$BLOCK_IPV6" == "1" ]]; then
-      printf 'block drop quick out inet6 all\n'
+      printf 'block drop out quick inet6 all\n'
     fi
-    printf 'pass out quick inet route-to (%s %s) all\n' "$TUN_DEV" "$SERVER_TUN_IP"
+    printf 'pass out quick route-to (%s %s) inet all\n' "$TUN_DEV" "$SERVER_TUN_IP"
   } > "$ANCHOR_CONF"
 }
 

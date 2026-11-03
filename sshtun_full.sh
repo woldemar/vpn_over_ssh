@@ -120,7 +120,12 @@ if [[ "$UNAME_S" == "Darwin" ]]; then
   MACOS_SERVICE="${MACOS_SERVICE:-com.sshtun.client}"
   # Единственная root-точка на macOS: root-owned хелпер, разрешённый в
   # sudoers (NOPASSWD). Прямого «sudo bash» на Darwin не вызываем никогда.
+  # Хелпер живёт в /opt (root-only); при запуске обёртки прямо из репозитория
+  # (где sshtun-root отсутствует) — fallback на /opt.
   ROOT_HELPER="${ROOT_HELPER:-$SCRIPT_DIR/sshtun-root}"
+  [[ -f "$ROOT_HELPER" || "$UNAME_S" != "Darwin" ]] || {
+    [[ -f /opt/sshtun_client/sshtun-root ]] && ROOT_HELPER=/opt/sshtun_client/sshtun-root
+  }
 else
   CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
 fi

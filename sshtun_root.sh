@@ -18,16 +18,14 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-BACKEND="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/sshtun_macos.sh"
-STATE_FILE="/var/run/sshtun/state"
-SERVICE_LABEL="com.sshtun.client"
-
-# env.conf (SSH_BIN/BASH_BIN и др.) — пишет install_macos.sh. Без него
-# backend мог бы запуститься системным bash 3.2 (sudo/env), а он падает
-# на "${arr[@]}" под set -u.
 # shellcheck disable=SC1091
 [[ -f "$(dirname -- "$0")/env.conf" ]] && source "$(dirname -- "$0")/env.conf"
 BASH_BIN="${BASH_BIN:-bash}"
+# Бэкенд живёт в репозитории (env.conf: SSHTUN_BACKEND) — обновляется git pull
+# без root; /opt-копия — fallback для случая без репозитория.
+BACKEND="${SSHTUN_BACKEND:-$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/sshtun_macos.sh}"
+STATE_FILE="/var/run/sshtun/state"
+SERVICE_LABEL="com.sshtun.client"
 
 case "${1:-}" in
   backend-run)
