@@ -238,8 +238,11 @@ pf_load_anchor() {
   pf_write_tables
   pf_write_anchor
   pf_ensure_enabled
-  pfctl -a "$PF_ANCHOR_NAME" -f "$ANCHOR_CONF" 2>/dev/null \
-    || die "pfctl не загрузил anchor (проверьте 'anchor \"$PF_ANCHOR_NAME\"' в /etc/pf.conf)"
+  local pf_err=""
+  pf_err="$(pfctl -a "$PF_ANCHOR_NAME" -f "$ANCHOR_CONF" 2>&1)" \
+    || die "pfctl не загрузил anchor: $pf_err
+anchors в ruleset: $(pfctl -s anchors 2>/dev/null | tr '\n' ' ')
+anchor-строка в pf.conf: $(grep -n 'anchor "com.sshtun"' /etc/pf.conf 2>/dev/null || echo 'ОТСУТСТВУЕТ')"
 }
 
 pf_flush_anchor() {
