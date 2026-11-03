@@ -152,7 +152,20 @@ func dial(addr string, cfg *ssh.ClientConfig, timeout time.Duration) (*ssh.Clien
 		_ = conn.Close()
 		return nil, err
 	}
-	return ssh.NewClient(c, chans, reqs), nil
+	client := ssh.NewClient(c, chans, reqs)
+	// Глобальные запросы соединения (keepalive@openssh.com от sshd по
+	// ClientAliveInterval) обязаны получать ответ — иначе сервер рвёт
+	// сессию ("Timeout, client not responding" в логах sshd). Временно
+	// логируем каждый запрос для диагностики.
+	go func() {
+		for r := range reqs {
+			log.Printf("global request: %s want_reply=%v", r.Type, r.WantReply)
+			if r.WantReply {
+				_ = r.Reply(false, nil)
+			}
+		}
+	}()
+	return client, nil
 }
 
 func loadSigner(path string) (ssh.Signer, error) {
@@ -236,8 +249,23 @@ func keepalive(c *ssh.Client, interval time.Duration, maxMisses int) {
 }
 
 // pump гоняет пакеты utun <-> канал до первой ошибки любого направления.
+// Периодически пишет статистику в stderr (бэкенд складывает её в ssh.log).
 func pump(ctx context.Context, dev *utunDevice, ch ssh.Channel) error {
 	errCh := make(chan error, 2)
+	var toSSH, fromSSH uint64
+
+	go func() {
+		t := time.NewTicker(10 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				log.Printf("stats: utun->ssh %d pkts, ssh->utun %d pkts", toSSH, fromSSH)
+			}
+		}
+	}()
 
 	// utun -> ssh
 	go func() {
@@ -250,6 +278,7 @@ func pump(ctx context.Context, dev *utunDevice, ch ssh.Channel) error {
 			if len(pkt) == 0 {
 				continue
 			}
+			toSSH++
 			if len(pkt) == 0 {
 				continue
 			}
@@ -296,6 +325,7 @@ func pump(ctx context.Context, dev *utunDevice, ch ssh.Channel) error {
 						errCh <- werr
 						return
 					}
+					fromSSH++
 				}
 			}
 			if err != nil {

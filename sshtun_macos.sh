@@ -204,9 +204,13 @@ pf_write_anchor() { # правила с подставленным utun/peer
     printf 'table <sshtun_includes> persist file "%s"\n' "$TBL_INCLUDES"
     printf 'table <sshtun_bypass> persist file "%s"\n' "$TBL_BYPASS"
     # порядок = семантика: include (равный префикс побеждает), exclude (LPM),
-    # bypass (сервер/шлюз/link-local), multicast, IPv6-block, catch-all в tun.
-    # Синтаксис pf строг: route-to — ДО proto/from/to; quick — после
-    # направления; block: "block drop out quick inet6 all".
+    # bypass (сервер/шлюз/link-local), multicast, IPv6-block, catch-all.
+    # Catch-all — БЕЗ route-to: иначе pf форвардит пакет с исходным src
+    # (192.168.x.x), а ответы теряются (наблюдено: 590 пакетов в туннель,
+    # 4 обратно). Вместо этого catch-all просто пропускаем, а в туннель
+    # трафик заворачивают ДВА ПОЛУ-DEFAULT'а в таблице маршрутизации
+    # (0.0.0.0/1 + 128.0.0.0/1 via peer — добавляет бэкенд): тогда src
+    # выбирает ядро адресом utun — как на Linux.
     printf 'pass out quick route-to (%s %s) inet from any to <sshtun_includes>\n' "$TUN_DEV" "$SERVER_TUN_IP"
     printf 'pass out quick inet from any to <sshtun_excludes>\n'
     printf 'pass out quick inet from any to <sshtun_bypass>\n'
@@ -214,7 +218,16 @@ pf_write_anchor() { # правила с подставленным utun/peer
     if [[ "$BLOCK_IPV6" == "1" ]]; then
       printf 'block drop out quick inet6 all\n'
     fi
-    printf 'pass out quick route-to (%s %s) inet all\n' "$TUN_DEV" "$SERVER_TUN_IP"
+    printf 'pass out quick inet all\n'
+    # ВХОД: pf включается ПОСЛЕ установки SSH-соединения — у него нет state,
+    # и inbound-сегменты (keepalive/data от сервера) дропались бы дефолтной
+    # политикой (наблюдено: «Timeout, client not responding» через ~90 с,
+    # туннель умирал). Пускаем inbound от сервера/шлюза (bypass), из LAN,
+    # link-local/mcast и DHCP-replies; ответы на наши исходящие и так
+    # проходят по state (keep state у pass out).
+    printf 'pass in quick inet from <sshtun_bypass> to any\n'
+    printf 'pass in quick inet from { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 224.0.0.0/4 } to any\n'
+    printf 'pass in quick proto udp from port 67 to port 68\n'
   } > "$ANCHOR_CONF"
 }
 
@@ -252,6 +265,22 @@ pf_flush_anchor() {
   if [[ "$HAD_PF_DISABLED" == "1" ]]; then
     pfctl -d >/dev/null 2>&1 || true
   fi
+}
+
+# Два полу-default'а через peer utun: catch-all маршрутизация в туннель без
+# pf route-to (чтобы src выбирался ядром адресом utun). Применяется ПОСЛЕ
+# ifconfig; снимается при stop. ВНИМАНИЕ: macOS route(8) не ест CIDR-форму
+# «-net 0.0.0.0/1» — только классика «-netmask 128.0.0.0».
+add_tunnel_routes() {
+  local rc=0
+  route -q add -net 0.0.0.0 -netmask 128.0.0.0 "$SERVER_TUN_IP" >/dev/null 2>&1 || rc=1
+  route -q add -net 128.0.0.0 -netmask 128.0.0.0 "$SERVER_TUN_IP" >/dev/null 2>&1 || rc=1
+  (( rc == 0 )) || log "WARNING: полу-default маршруты не добавились (route add rc=$rc)"
+}
+
+del_tunnel_routes() {
+  route -q delete -net 0.0.0.0 -netmask 128.0.0.0 "$SERVER_TUN_IP" >/dev/null 2>&1 || true
+  route -q delete -net 128.0.0.0 -netmask 128.0.0.0 "$SERVER_TUN_IP" >/dev/null 2>&1 || true
 }
 
 # Живое применение diff'ов от обёртки: пересобираем таблицы из файлов
@@ -496,8 +525,9 @@ start_vpn() {
   ifconfig "$TUN_DEV" inet "$CLIENT_TUN_IP" "$SERVER_TUN_IP" mtu "$TUN_MTU" up \
     || die "ifconfig $TUN_DEV не удался"
 
-  # маршрутная политика (pf)
+  # маршрутная политика (pf + полу-default'а в таблице)
   pf_load_anchor
+  add_tunnel_routes
   log "pf anchor $PF_ANCHOR_NAME загружен ($TUN_DEV -> $SERVER_TUN_IP)"
 
   # state пишем ДО dns_save_and_set: та ДОПИСЫВАЕТ DNS_* в конец файла,
@@ -535,6 +565,7 @@ stop_cleanup() {
   # DNS восстанавливаем ПЕРВЫМ (пока есть state)
   if [[ -f "$STATE_FILE" ]]; then
     dns_restore || true
+    del_tunnel_routes || true
   fi
 
   # ssh
@@ -609,6 +640,9 @@ doctor_vpn() {
   echo
   echo "== last ssh log =="
   tail -n 15 "$SSH_LAST_LOG" 2>/dev/null || echo "(none)"
+  echo
+  echo "== live data-plane log =="
+  tail -n 20 "$SSH_LOG" 2>/dev/null || echo "(none)"
   echo
   echo "== default route =="
   route -n get default 2>/dev/null | sed -n '1,8p' || true
