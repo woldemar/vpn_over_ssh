@@ -16,6 +16,8 @@ IFS=$'\n\t'
 #   includes-force.txt     — принудительно В ТУННЕЛЬ (приоритет над excludes)
 #   generated/             — АВТОГЕН: развёрнутые префиксы AS/стран (не править;
 #                            обновляются 'sshtun refresh' / автоматически при 'up')
+#   servers/<имя>.conf     — профили серверов (multihop-библиотека; активный
+#                            профиль ставится в server.conf командой 'server use')
 #
 # Приоритет: ядро выбирает по длине префикса (LPM) — более точный префикс
 # побеждает независимо от файла. На равных префиксах побеждает force-файл.
@@ -42,6 +44,12 @@ IFS=$'\n\t'
 #                       --remove CC — убрать страну из списка)
 #   refresh             перекачать все автогенные списки
 #   list                показать эффективную маршрутную политику
+#   server list         список профилей серверов ('*' — активный)
+#   server add NAME HOST [--port N] [--user U] [--key FILE]
+#                       [--tun-start N] [--tun-end N] [--mtu N]
+#                       [--net-a A] [--net-b B] [-- комментарий]
+#   server use NAME     переключиться на профиль (переподнимет туннель)
+#   server del NAME     удалить профиль (активный удалить нельзя)
 #
 # Файлы AS/стран — источники-токены (править руками или командами выше);
 # развёрнутые префиксы кладутся в ~/sshtun/generated/ и там же кэшируются
@@ -58,6 +66,18 @@ IFS=$'\n\t'
 # SERVER_HOST намеренно НЕ имеет дефолта в коде: реальный адрес сервера
 # задаётся локально — через env SERVER_HOST или файл ~/sshtun/server.conf
 # (создаётся установщиком из шаблона, в репозиторий не коммитится).
+# Адрес и параметры, заданные через env (имеют приоритет над любыми
+# файлами) — запоминаем до чтения server.conf, чтобы 'server use' мог
+# перечитать конфиг свежим и при этом не перекрыть явный env.
+SERVER_HOST_FROM_ENV="${SERVER_HOST:-}"
+SERVER_PORT_FROM_ENV="${SERVER_PORT:-}"
+SSH_USER_FROM_ENV="${SSH_USER:-}"
+KEY_FILE_FROM_ENV="${KEY_FILE:-}"
+TUN_START_FROM_ENV="${TUN_START:-}"
+TUN_END_FROM_ENV="${TUN_END:-}"
+MTU_FROM_ENV="${MTU:-}"
+TUN_NET_A_FROM_ENV="${TUN_NET_A:-}"
+TUN_NET_B_FROM_ENV="${TUN_NET_B:-}"
 SERVER_HOST="${SERVER_HOST:-}"
 SERVER_PORT="${SERVER_PORT:-65523}"
 SSH_USER="${SSH_USER:-sshvpn}"
@@ -65,6 +85,12 @@ KEY_FILE="${KEY_FILE:-$HOME/.ssh/sshtun_ed25519}"
 TUN_START="${TUN_START:-200}"
 TUN_END="${TUN_END:-300}"
 MTU="${MTU:-1400}"
+# Адресация туннельной пары: клиент вычисляет свою/серверную IP из номера
+# tun (как и серверный apply-network.sh). Дефолт 10.250/16 должен совпадать
+# с серверным TUN_NET_A/TUN_NET_B; сервер с другой адресацией (например,
+# второй сервер в 10.251/16) задаётся в профиле (--net-a/--net-b).
+TUN_NET_A="${TUN_NET_A:-10}"
+TUN_NET_B="${TUN_NET_B:-250}"
 
 # Директория скрипта с разрешением симлинков: обёртка может быть
 # установлена как symlink в /usr/local/bin/sshtun -> /opt/sshtun_client/.
@@ -78,10 +104,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P)"
 CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
 
 EXCLUDES_DIR="${EXCLUDES_DIR:-$HOME/sshtun}"
-# SERVER_HOST из локального конфиг-файла (env имеет приоритет).
-if [[ -z "$SERVER_HOST" && -f "$EXCLUDES_DIR/server.conf" ]]; then
-  SERVER_HOST="$(sed -n 's/^SERVER_HOST=//p' "$EXCLUDES_DIR/server.conf" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
-fi
+# Профили серверов: библиотека в servers/*.conf + активный server.conf.
+# server.conf остаётся рабочим конфигом (backward compat: служба и env-логика
+# его не замечают) — 'server use <name>' атомарно устанавливает профиль в него.
+SERVER_CONF="$EXCLUDES_DIR/server.conf"
+SERVERS_DIR="$EXCLUDES_DIR/servers"
+# Активный профиль (server.conf, в т.ч. старый ручной) читается после
+# определения функций — см. reload_server_conf вызов перед dispatch: env
+# побеждает, из файла подтягиваются все параметры сервера.
 BASE_EXCLUDES="$EXCLUDES_DIR/excludes.txt"
 CUSTOM_EXCLUDES="$EXCLUDES_DIR/excludes-custom.txt"
 AS_EXCLUDES="$EXCLUDES_DIR/excludes-as.txt"
@@ -130,6 +160,16 @@ usage() {
   $0 fetch-country --remove CC...  убрать страну из списка
   $0 refresh            перекачать все автогенные списки
   $0 list               показать маршрутную политику
+  $0 server list        список профилей серверов ('*' — активный)
+  $0 server add NAME HOST [--port N] [--user U] [--key FILE]
+                        [--tun-start N] [--tun-end N] [--mtu N]
+                        [--net-a A] [--net-b B] [-- комментарий]
+                        добавить профиль сервера
+                        (--net-a/--net-b — адресация туннельной пары,
+                        должна совпадать с серверными TUN_NET_A/TUN_NET_B)
+  $0 server use NAME    переключиться на профиль (туннель переподнимется,
+                        если работает; иначе применится при следующем up)
+  $0 server del NAME    удалить профиль (активный удалить нельзя)
 
 Устаревшие алиасы: add/del = exclude add/del; force-add/force-del = include add/del.
 
@@ -220,6 +260,204 @@ parse_cidrs_comment() {
       _cidrs+=("$arg")
     fi
   done
+}
+
+# Значение ключа KEY=... из профиля/конфига (последняя строка). Файл не
+# source'ится нарочно: иначе профиль мог бы выполнить произвольный код от
+# имени пользователя, запустившего sshtun.
+conf_key() { # file key
+  local out=""
+  out="$(sed -n "s/^$2=//p" "$1" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+  printf '%s' "$out"
+}
+
+# Перечитать параметры сервера из активного server.conf. Нужна после
+# 'server use': переменные скрипта прочитаны на старте, а профиль только
+# что сменился. env (сохранён в *_FROM_ENV на старте) побеждает файл;
+# отсутствующие в файле ключи оставляем дефолтными.
+reload_server_conf() {
+  [[ -f "$SERVER_CONF" ]] || return 0
+  SERVER_HOST="${SERVER_HOST_FROM_ENV:-$(conf_key "$SERVER_CONF" SERVER_HOST)}"
+  SERVER_PORT="${SERVER_PORT_FROM_ENV:-$(conf_key "$SERVER_CONF" SERVER_PORT)}"
+  [[ -n "$SERVER_PORT" ]] || SERVER_PORT=65523
+  SSH_USER="${SSH_USER_FROM_ENV:-$(conf_key "$SERVER_CONF" SSH_USER)}"
+  [[ -n "$SSH_USER" ]] || SSH_USER=sshvpn
+  KEY_FILE="${KEY_FILE_FROM_ENV:-$(conf_key "$SERVER_CONF" KEY_FILE)}"
+  [[ -n "$KEY_FILE" ]] || KEY_FILE="$HOME/.ssh/sshtun_ed25519"
+  TUN_START="${TUN_START_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_START)}"
+  [[ -n "$TUN_START" ]] || TUN_START=200
+  TUN_END="${TUN_END_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_END)}"
+  [[ -n "$TUN_END" ]] || TUN_END=300
+  MTU="${MTU_FROM_ENV:-$(conf_key "$SERVER_CONF" MTU)}"
+  [[ -n "$MTU" ]] || MTU=1400
+  TUN_NET_A="${TUN_NET_A_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_NET_A)}"
+  [[ -n "$TUN_NET_A" ]] || TUN_NET_A=10
+  TUN_NET_B="${TUN_NET_B_FROM_ENV:-$(conf_key "$SERVER_CONF" TUN_NET_B)}"
+  [[ -n "$TUN_NET_B" ]] || TUN_NET_B=250
+}
+
+# Имя активного профиля — маркер '# sshtun-profile: NAME', который 'server use'
+# пишет в server.conf. Пусто — server.conf сделан/правлен вручную.
+active_profile() {
+  local marker=""
+  [[ -f "$SERVER_CONF" ]] || return 0
+  marker="$(sed -n 's/^# sshtun-profile:[[:space:]]*//p' "$SERVER_CONF" 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+  printf '%s' "$marker"
+}
+
+# Комментарий профиля из его шапки ('# comment: ...' пишет 'server add').
+profile_comment() { # file
+  local out=""
+  out="$(sed -n 's/^# comment:[[:space:]]*//p' "$1" 2>/dev/null | tail -n1)"
+  printf '%s' "$out"
+}
+
+# Строка-описание активного сервера для status: профиль, а иначе откуда адрес.
+profile_display() {
+  if [[ -n "$SERVER_HOST_FROM_ENV" ]]; then
+    printf 'env SERVER_HOST=%s (перекрывает профили)' "$SERVER_HOST_FROM_ENV"
+    return 0
+  fi
+  local name="" host=""
+  name="$(active_profile)"
+  host="$(conf_key "$SERVER_CONF" SERVER_HOST)"
+  if [[ -n "$name" ]]; then
+    printf '%s (%s)' "$name" "${host:-?}"
+  elif [[ -n "$host" ]]; then
+    printf '(server.conf без профиля) %s' "$host"
+  else
+    printf '(не задан — см. sshtun server add)'
+  fi
+}
+
+# Атомарно установить профиль активным: временный файл + mv (никто не поймает
+# обрезанный server.conf), владелец/права — как у ~/sshtun.
+activate_profile() { # name
+  local name="$1" src="$SERVERS_DIR/$1.conf" tmp=""
+  mkdir -p "$EXCLUDES_DIR"
+  tmp="$(mktemp "$EXCLUDES_DIR/.server.conf.XXXXXX")"
+  {
+    printf '# SSHTUN: активный профиль сервера (установлено: sshtun server use %s)\n' "$name"
+    printf '# sshtun-profile: %s\n' "$name"
+    cat "$src"
+  } > "$tmp"
+  mv -f "$tmp" "$SERVER_CONF"
+  restore_owner "$SERVER_CONF"
+}
+
+server_list() {
+  echo "=== СЕРВЕРЫ (профили: $SERVERS_DIR/*.conf; '*' — активный):"
+  if [[ ! -d "$SERVERS_DIR" ]] || ! ls "$SERVERS_DIR"/*.conf >/dev/null 2>&1; then
+    echo "    (профилей нет — добавьте: sshtun server add NAME HOST [--port N] [--user U] [--key FILE] [--mtu N] [-- комментарий])"
+  else
+    local f="" name="" host="" port="" comment="" cur=""
+    cur="$(active_profile)"
+    for f in "$SERVERS_DIR"/*.conf; do
+      name="$(basename "$f" .conf)"
+      host="$(conf_key "$f" SERVER_HOST)"
+      port="$(conf_key "$f" SERVER_PORT)"; port="${port:-65523}"
+      comment="$(profile_comment "$f")"
+      printf '    %s %-20s %-30s порт %s' "$([[ "$name" == "$cur" ]] && printf '*' || printf ' ')" "$name" "${host:-?}" "$port"
+      [[ -n "$comment" ]] && printf '   # %s' "$comment"
+      printf '\n'
+    done
+  fi
+  echo
+  echo "    Активный: $(profile_display)"
+  echo "    Переключение: sshtun server use NAME (туннель переподнимется, если работает)"
+  if [[ -n "$SERVER_HOST_FROM_ENV" ]]; then
+    echo "    ВНИМАНИЕ: SERVER_HOST задан через env — перекрывает любые профили/файлы."
+  fi
+}
+
+server_add() {
+  local name="${1:-}" host="${2:-}"
+  [[ -n "$name" && -n "$host" ]] \
+    || die "Укажите имя и адрес: $0 server add NAME HOST [--port N] [--user U] [--key FILE] [--tun-start N] [--tun-end N] [--mtu N] [-- комментарий]"
+  [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] \
+    || die "Недопустимое имя профиля: $name (допустимы [A-Za-z0-9_-], начало с буквы/цифры)"
+  [[ "$host" != *[[:space:]]* ]] || die "Адрес не должен содержать пробелов: $host"
+  shift 2  # name и host гарантированно есть (проверка выше)
+  local port="$SERVER_PORT" user="$SSH_USER" key="$KEY_FILE" mtu="$MTU"
+  local tstart="$TUN_START" tend="$TUN_END" comment="" a=""
+  local net_a="$TUN_NET_A" net_b="$TUN_NET_B"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --port)      port="${2:-}"; shift 2 ;;
+      --user)      user="${2:-}"; shift 2 ;;
+      --key)       key="${2:-}"; shift 2 ;;
+      --tun-start) tstart="${2:-}"; shift 2 ;;
+      --tun-end)   tend="${2:-}"; shift 2 ;;
+      --mtu)       mtu="${2:-}"; shift 2 ;;
+      --net-a)     net_a="${2:-}"; shift 2 ;;
+      --net-b)     net_b="${2:-}"; shift 2 ;;
+      --)          shift; comment=""
+                   for a in "$@"; do comment+="${comment:+ }$a"; done
+                   break ;;
+      *) die "Неизвестная опция: $1" ;;
+    esac
+  done
+  local dest="$SERVERS_DIR/$name.conf"
+  [[ ! -f "$dest" ]] || die "Профиль '$name' уже существует: $dest (убрать: sshtun server del $name)"
+  mkdir -p "$SERVERS_DIR"
+  restore_owner "$SERVERS_DIR"
+  local comment_line=""
+  [[ -n "$comment" ]] && comment_line="# comment: $comment"
+  cat > "$dest" <<EOFPROFILE
+# SSHTUN-профиль сервера '$name'. Файл данных — в git не коммитится.
+# Применить: sshtun server use $name
+$comment_line
+SERVER_HOST=$host
+SERVER_PORT=$port
+SSH_USER=$user
+KEY_FILE=$key
+TUN_START=$tstart
+TUN_END=$tend
+MTU=$mtu
+# Адресация туннельной пары — должна совпадать с серверными
+# TUN_NET_A/TUN_NET_B (у второго сервера своя, чтобы не пересекаться).
+TUN_NET_A=$net_a
+TUN_NET_B=$net_b
+EOFPROFILE
+  restore_owner "$dest"
+  log "Профиль '$name' создан: $dest"
+  log "Переключиться: sshtun server use $name"
+}
+
+server_del() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Укажите имя профиля: $0 server del NAME"
+  local f="$SERVERS_DIR/$name.conf"
+  [[ -f "$f" ]] || die "Профиль не найден: $f"
+  [[ "$(active_profile)" != "$name" ]] \
+    || die "Профиль '$name' активен — сначала переключитесь: sshtun server use ДРУГОЕ_ИМЯ"
+  rm -f "$f"
+  log "Профиль '$name' удалён"
+}
+
+server_use() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || die "Укажите имя профиля: $0 server use NAME (список: sshtun server list)"
+  local src="$SERVERS_DIR/$name.conf"
+  [[ -f "$src" ]] || die "Профиль не найден: $src (добавить: sshtun server add $name HOST)"
+  local host=""
+  host="$(conf_key "$src" SERVER_HOST)"
+  [[ -n "$host" ]] || die "В профиле '$name' нет SERVER_HOST: $src"
+  if [[ "$(active_profile)" == "$name" ]]; then
+    log "Профиль '$name' уже активен ($host)"
+    return 0
+  fi
+  [[ -z "$SERVER_HOST_FROM_ENV" ]] \
+    || log "ВНИМАНИЕ: SERVER_HOST задан через env — файл/профиль им перекрывается"
+  activate_profile "$name"
+  reload_server_conf
+  log "Переключено на '$name' ($SERVER_HOST)"
+  if tun_is_running; then
+    log "Туннель работает — переподнимаю на новом сервере"
+    restart_vpn
+  else
+    log "Туннель не работает — профиль применится при 'sshtun up'"
+  fi
 }
 
 # Есть ли CIDR в файле (сравнение по первому токену строки, комментарии
@@ -494,7 +732,8 @@ start_vpn() {
   local foreground=0
   [[ "${1:-}" == "--foreground" ]] && foreground=1
   [[ -n "$SERVER_HOST" ]] || die "SERVER_HOST не задан. Укажите адрес сервера:
-  - в файле $EXCLUDES_DIR/server.conf (строка SERVER_HOST=your-server), или
+  - через профиль: sshtun server add NAME HOST && sshtun server use NAME, или
+  - в файле $SERVER_CONF (строка SERVER_HOST=your-server), или
   - через env: SERVER_HOST=your-server sshtun up"
   # Быстрый отказ, если туннель уже жив: клиент проверил бы это сам, но ПОСЛЕ
   # ensure_autogen (перекачка списков) — а при restart-цикле службы против
@@ -530,11 +769,14 @@ start_vpn() {
     # а не получает SIGKILL посреди cleanup (было: t201 чист, t200 — нет).
     # Падение любого звена всё равно видно systemd как смерть main -> рестарт
     # (Restart=always), ручной down идёт через 'systemctl stop' (маркер
-    # SUPERVISED=1 в state).
+    # SUPERVISED=1 в state). TUN_NET_* пробрасываем через env: sudo по
+    # умолчанию сбрасывает окружение, а клиент считает IP-пару из него.
     args+=(--foreground)
-    exec sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+    exec sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+      bash "$CLIENT_SCRIPT" start "${args[@]}"
   fi
-  sudo bash "$CLIENT_SCRIPT" start "${args[@]}"
+  sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+    bash "$CLIENT_SCRIPT" start "${args[@]}"
 }
 
 # Маркер SUPERVISED из state работающего туннеля ("1" — под досмотром systemd).
@@ -1058,12 +1300,17 @@ legacy_hint() {
   log "Подсказка: синтаксис устарел — используйте: sshtun $1"
 }
 
+# Активный профиль: применить server.conf (env побеждает файл).
+# До dispatch — чтобы ВСЕ команды (up/status/list/...) видели параметры
+# сервера из активного профиля, а не только 'server use'.
+reload_server_conf
+
 cmd="${1:-}"
 case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
   down|stop)       shift; stop_vpn "$@" ;;
   restart)         shift; restart_vpn "$@" ;;
-  status)          shift; check_client; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
+  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
   doctor)          shift; check_client; sudo bash "$CLIENT_SCRIPT" doctor "$@" ;;
   cleanup)         shift; check_client; sudo bash "$CLIENT_SCRIPT" cleanup "$@" ;;
   exclude)
@@ -1092,6 +1339,17 @@ case "$cmd" in
   fetch-country)   shift; fetch_country "$@" ;;
   refresh)         shift; refresh_lists "$@" ;;
   list)            shift; list_policy "$@" ;;
+  server)
+    shift
+    [[ $# -ge 1 ]] || die "Укажите подкоманду: $0 server list|add|use|del ..."
+    sub="${1:-}"; shift
+    case "$sub" in
+      list|ls)  server_list "$@" ;;
+      add)      server_add "$@" ;;
+      use)      server_use "$@" ;;
+      del|rm)   server_del "$@" ;;
+      *) die "Неизвестная подкоманда: server $sub (нужно list|add|use|del)" ;;
+    esac ;;
   -h|--help|help|"") usage ;;
   *) die "Неизвестная команда: $cmd (см. $0 --help)" ;;
 esac
