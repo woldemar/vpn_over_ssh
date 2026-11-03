@@ -50,7 +50,10 @@ TUN_MTU="${TUN_MTU:-1400}"
 
 TUN_NET_A="${TUN_NET_A:-10}"
 TUN_NET_B="${TUN_NET_B:-250}"
-TUN_POOL_CIDR="${TUN_POOL_CIDR:-10.250.0.0/16}"
+# Дефолт CIDR выводится из NET_A/NET_B: при смене адресации сервера
+# (например, второй сервер в 10.251.0.0/16, чтобы не пересекаться
+# с первым) NAT подхватывается автоматически.
+TUN_POOL_CIDR="${TUN_POOL_CIDR:-$TUN_NET_A.$TUN_NET_B.0.0/16}"
 
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
 NOLOGIN_BIN="${NOLOGIN_BIN:-/usr/sbin/nologin}"
