@@ -359,7 +359,11 @@ start_vpn() {
   resolve_server_ipv4
   log "Server real IP: $SERVER_REAL_IP"
 
-  # случайный номер из диапазона; сервер должен иметь tunN в своём пуле
+  # случайный номер из диапазона; сервер должен иметь tunN в своём пуле.
+  # ВАЖНО (macOS): локальный и удалённый номера -w НЕ обязаны совпадать.
+  # Локально берём МАЛЕНЬКИЙ свободный utun (0..~3 занимает система, высокие
+  # номера ядро macOS не отдаёт: «Tunnel device open failed»), а серверу
+  # просим tunN из пула — адресация считается по НОМЕРУ СЕРВЕРА.
   TUN_NUM=$((RANDOM % (TUN_END - TUN_START + 1) + TUN_START))
   calc_pair_ips "$TUN_NUM"
   log "Trying tun$TUN_NUM: client=$CLIENT_TUN_IP, server=$SERVER_TUN_IP"
@@ -371,10 +375,19 @@ start_vpn() {
   before_utuns="$(mktemp)"
   utun_list > "$before_utuns"
 
+  # локальный utun: первый свободный из 4..15
+  local local_utun=""
+  local n=0
+  for n in 4 5 6 7 8 9 10 11 12 13 14 15; do
+    if ! grep -qxF "utun$n" "$before_utuns"; then local_utun="$n"; break; fi
+  done
+  [[ -n "$local_utun" ]] || die "Нет свободного utun (4..15 заняты)"
+
   # SSH: BatchMode (ключ без passphrase), KeepAlive — как на Linux.
   # RemoteCommand запрещён на сервере, -N — просто держим туннель.
+  # -w local:remote — локальный utun4..15 (macOS), удалённый tunN из пула.
   ssh -i "$KEY_FILE" -p "$SSH_PORT" -l "$SSH_USER" \
-      -w "$TUN_NUM:$TUN_NUM" \
+      -w "$local_utun:$TUN_NUM" \
       -o Tunnel=point-to-point \
       -o ExitOnForwardFailure=yes \
       -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \

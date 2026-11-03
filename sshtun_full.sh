@@ -531,6 +531,15 @@ server_rename() { # old new
   fi
 }
 
+# Содержимое активного server.conf совпадает с профилем (без двух строк
+# служебной шапки)? Нужно, чтобы 'server use' замечал ручные правки
+# профиля после активации и переустанавливал конфиг, а не молчал «уже активен».
+profile_is_active_content() { # name -> 0 если server.conf == профиль
+  local src="$SERVERS_DIR/$1.conf"
+  [[ -f "$SERVER_CONF" && -f "$src" ]] || return 1
+  diff -q <(tail -n +3 "$SERVER_CONF") "$src" >/dev/null 2>&1
+}
+
 server_use() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "Укажите имя профиля: $0 server use NAME (список: sshtun server list)"
@@ -539,7 +548,7 @@ server_use() {
   local host=""
   host="$(conf_key "$src" SERVER_HOST)"
   [[ -n "$host" ]] || die "В профиле '$name' нет SERVER_HOST: $src"
-  if [[ "$(active_profile)" == "$name" ]]; then
+  if [[ "$(active_profile)" == "$name" ]] && profile_is_active_content "$name"; then
     log "Профиль '$name' уже активен ($host)"
     return 0
   fi
