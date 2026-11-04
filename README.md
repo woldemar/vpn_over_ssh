@@ -1,8 +1,8 @@
 # VPN over SSH
 
-Проект реализует L3-туннель поверх обычного SSH с использованием `ssh -w` / OpenSSH TUN. Сервер поднимает пул TUN-интерфейсов, клиенты случайно выбирают свободный `tunN`, подключаются по SSH и направляют трафик через зашифрованный SSH-канал.
+Проект реализует L3-туннель поверх обычного SSH с использованием OpenSSH TUN (`ssh -w` на Linux/Windows; на macOS — wire-протокол `tun@openssh.com` в userspace, т.к. ни Apple, ни portable OpenSSH utun не поддерживают). Сервер поднимает пул TUN-интерфейсов, клиенты случайно выбирают свободный `tunN`, подключаются по SSH и направляют трафик через зашифрованный SSH-канал.
 
-Основная идея MVP: использовать стандартный OpenSSH вместо отдельного VPN-сервера. На сервере достаточно отдельного `sshd`-инстанса с `PermitTunnel point-to-point`, подготовленного пула `tun200..tun250` и NAT. На клиентах используются Linux shell-клиент или Windows Go/Wintun-клиент.
+Основная идея MVP: использовать стандартный OpenSSH вместо отдельного VPN-сервера. На сервере достаточно отдельного `sshd`-инстанса с `PermitTunnel point-to-point`, подготовленного пула `tun200..tun250` и NAT. На клиентах используются Linux shell-клиент, macOS-клиент (bash-бэкенд + собственный Go data-plane) или Windows Go/Wintun-клиент.
 
 ## Схема работы
 
@@ -12,6 +12,7 @@ User workstation
     | local TUN adapter
     |
 Linux: sshtun_pool_client.sh
+macOS: sshtun_macos.sh + Go data-plane (utun userspace)
 Windows: sshtun_pool_client.exe + Wintun
     |
     | SSH TCP, tun@openssh.com / ssh -w N:N
@@ -40,7 +41,7 @@ tun250 -> server 10.250.0.201, client 10.250.0.202
 ├── CHANGELOG.md
 ├── docs/
 │   ├── HOWTO.md                — инструкция по тестированию клиента (Linux)
-│   ├── HOWTO-macos.md          — спецификация порта под macOS (launchd, тест-матрица)
+│   ├── HOWTO-macos.md          — macOS-клиент: установка, тесты, служба (Intel и Apple Silicon)
 │   └── SERVER-BBR.md           — пошаговый мануал: переключение сервера на BBR
 ├── examples/                   — шаблоны файлов маршрутной политики
 │   ├── excludes.txt
@@ -48,9 +49,15 @@ tun250 -> server 10.250.0.201, client 10.250.0.202
 │   ├── excludes-as.txt
 │   └── excludes-country.txt
 ├── install_client.sh           — установка/удаление/обновление Linux-клиента
+├── install_macos.sh            — установка/удаление macOS-клиента (plist службы, sudoers, data-plane)
 ├── install_server.sh
-├── sshtun_full.sh
-├── sshtun_pool_client.sh
+├── prepare_macos.sh            — сборка bash>=4.3 + ssh в ~/sshtun-tools без brew (CLT)
+├── sshtun_full.sh              — общая обёртка (Linux и macOS: выбор бэкенда по ОС)
+├── sshtun_pool_client.sh       — Linux-бэкенд
+├── sshtun_macos.sh             — macOS-бэкенд (pfctl, scutil, launchd)
+├── sshtun_root.sh              — root-хелпер macOS (единственная NOPASSWD-команда)
+├── sshtun_macos_client/        — Go data-plane macOS (tun@openssh.com в userspace;
+│                                 бинарники amd64/arm64 идут в репозитории)
 └── sshtun_pool_windows_client
     ├── README.md
     ├── build.ps1
@@ -154,6 +161,29 @@ journalctl -u sshtun -f    # лог
 Для службы ключ должен быть без passphrase (SSH BatchMode). Проверка и
 сценарии: [`docs/HOWTO.md`](docs/HOWTO.md).
 
+### macOS-клиент (`install_macos.sh`, `sshtun_macos.sh`)
+
+Тот же контракт CLI/state и та же обёртка `sshtun`, что на Linux (она
+выбирает бэкенд по ОС). Отличия: маршрутная политика через **pfctl**
+(таблицы exclude/include + полу-default'ы 0.0.0.0/1 + 128.0.0.0/1 через
+utun), DNS через **scutil**, блок IPv6 правилом pf, служба досмотра —
+**launchd**. Транспорт — собственный **Go data-plane**
+(`sshtun_macos_client/`, протокол `tun@openssh.com` в userspace): `ssh -w`
+на macOS неработоспособен в принципе (ни Apple, ни portable OpenSSH не
+поддерживают utun). Бинарники для Intel и Apple Silicon лежат в репозитории,
+установщик выбирает по `uname -m`. Root-доступ — только через root-owned
+хелпер `/opt/sshtun_client/sshtun-root` (единственная команда в
+NOPASSWD-sudoers).
+
+```bash
+bash prepare_macos.sh                      # bash>=4.3 + ssh -> ~/sshtun-tools (без brew, нужен CLT)
+sudo bash install_macos.sh install
+sshtun up
+sudo /opt/sshtun_client/sshtun-root service-start   # служба launchd (KeepAlive; переживает сон)
+```
+
+Полная инструкция, тесты и диагностика: [`docs/HOWTO-macos.md`](docs/HOWTO-macos.md).
+
 ### `sshtun_full.sh`
 
 Обёртка над `sshtun_pool_client.sh` для постоянного режима «full-tunnel + исключения» (см. `CHANGELOG.md`). Поддерживает:
@@ -164,11 +194,11 @@ journalctl -u sshtun -f    # лог
   - `excludes-custom.txt` — пополняемый пользователем список исключений;
   - `excludes-as.txt` — источники-токены автономных систем (`AS9009`), по одному на строку; править руками или `fetch-as`;
   - `excludes-country.txt` — источники-токены стран по ISO-кодам (`ru`), править руками или `fetch-country`;
-  - `generated/excludes-as.txt`, `generated/excludes-country.txt` — автоген: развёрнутые префиксы источников (не править; обновляются `refresh`/`up`, при отсутствии сети используется последний кэш);
+  - `generated/excludes-as.txt`, `generated/excludes-country.txt` — автоген: развёрнутые префиксы источников (не править; обновляются `refresh`, при `up` — автообновление не чаще раза в 12 ч, при отсутствии сети используется последний кэш);
   - `includes-force.txt` — принудительно «в туннель», приоритет над exclude-файлами;
 - команды: `exclude add` / `exclude del` (пользовательские исключения), `include add` / `include del` (force-список) — обе пары принимают `-- комментарий`, он сохраняется в файле и виден в `list`; `fetch-as AS... [--irr] [--remove AS...]`, `fetch-country CC... [--remove CC...]`, `refresh` (перекачка автогенных списков), `list` (показ эффективной политики); устаревшие `add`/`del`/`force-add`/`force-del` работают как алиасы с подсказкой миграции;
 - мультисервер: профили `~/sshtun/servers/<имя>.conf` (`server add NAME HOST [--port N] [--user U] [--key FILE] [--tun-start N] [--tun-end N] [--mtu N] [--net-a A] [--net-b B] [-- комментарий)]`, `server list`, `server use NAME` — атомарно ставит профиль активным и переподнимает туннель, если он работает, `server del NAME` — активный удалить нельзя); активный профиль живёт в привычном `~/sshtun/server.conf` (обратная совместимость со службой и env-логикой), маркер `# sshtun-profile:`; `--net-a/--net-b` должны совпадать с серверной адресацией (второй сервер — в своём /16, например 10.251/16, чтобы не пересекаться с первым); env `SERVER_HOST` по-прежнему имеет самый высокий приоритет и об этом предупреждает; одновременная работа с несколькими серверами не поддерживается;
-- файлы-токены `excludes-as.txt` / `excludes-country.txt` — это и есть «список AS/стран»: дописывай токены (`AS9009`, `ru`) напрямую в файл или командами fetch — развёртывание в префиксы происходит при `refresh` и автоматически при `up`; пользовательские комментарии в этих файлах сохраняются;
+- файлы-токены `excludes-as.txt` / `excludes-country.txt` — это и есть «список AS/стран»: дописывай токены (`AS9009`, `ru`) напрямую в файл или командами fetch — развёртывание в префиксы происходит при `refresh` и (с TTL 12 ч) при `up`; пользовательские комментарии в этих файлах сохраняются;
 - изменения применяются сразу, без перезапуска, если туннель поднят; массовые изменения (тысячи префиксов) идут одним netlink-батчем `ip -batch` (5000 маршрутов — ~0.2 с);
 - приоритет маршрутов: ядро выбирает самый длинный префикс (LPM); на равных префиксах include побеждает exclude.
 
@@ -222,6 +252,17 @@ Windows-клиент на Go. Использует Wintun и совместим�
 - `flock`;
 - `getent`;
 - желательно `resolvectl` для DNS.
+
+### macOS-клиент
+
+Нужны:
+
+- macOS Sonoma/Sequoia (Intel и Apple Silicon);
+- **bash >= 4.3** (системный bash 3.2 не подходит) — ставится без brew
+  через `bash prepare_macos.sh` (нужен Xcode CLT);
+- data-plane-бинарь идёт в репозитории (обе архитектуры).
+
+Подробности: [`docs/HOWTO-macos.md`](docs/HOWTO-macos.md).
 
 ### Windows-клиент
 
@@ -356,6 +397,20 @@ sudo bash sshtun_pool_client.sh status
 sudo bash sshtun_pool_client.sh doctor
 sudo bash sshtun_pool_client.sh cleanup
 ```
+
+### 3а. Подключение с macOS
+
+```bash
+bash prepare_macos.sh && sudo bash install_macos.sh install
+ssh-keygen -t ed25519 -f ~/.ssh/sshtun_ed25519 -N "" -C "$(whoami)-$(hostname)"
+# публичный ключ -> /opt/sshtun_pool/authorized_keys на сервере
+sshtun server add fin SERVER_IP -- "основной"
+sshtun up
+sudo /opt/sshtun_client/sshtun-root service-start   # досмотр launchd
+```
+
+Полный мануал (тесты политики, служба, сон ноутбука, диагностика):
+[`docs/HOWTO-macos.md`](docs/HOWTO-macos.md).
 
 ### 4. Сборка Windows-клиента
 
@@ -581,6 +636,22 @@ sudo bash sshtun_pool_client.sh status
 sudo bash sshtun_pool_client.sh doctor
 ```
 
+### macOS-клиент
+
+```text
+/var/run/sshtun/state
+/var/run/sshtun/ssh.log        # live-лог data-plane
+/var/log/sshtun.log            # лог службы launchd
+```
+
+Команды:
+
+```bash
+sshtun status                  # state, pf, utun, DNS
+sudo /opt/sshtun_client/sshtun-root backend-run doctor
+sudo /opt/sshtun_client/sshtun-root backend-run pfprobe   # маршруты/pf states/счётчики
+```
+
 ### Windows-клиент
 
 ```text
@@ -672,6 +743,11 @@ systemctl status sshtun-pool-network.service --no-pager
 PermitTunnel point-to-point
 ```
 
+На **macOS** «Tunnel device open failed» — ожидаемое поведение для любого
+ssh (Apple и portable не умеют utun): используется собственный data-plane
+`sshtun-macos-tun` из репозитория; если он не найден — установщик
+сообщит об этом, см. [`docs/HOWTO-macos.md`](docs/HOWTO-macos.md).
+
 ### Подключение есть, но интернет не работает
 
 Проверить серверный NAT и forwarding:
@@ -687,11 +763,15 @@ ip route
 
 ### DNS не работает
 
-Linux-клиент использует `resolvectl`, если он установлен. Проверить:
+Linux-клиент использует `resolvectl`, если он установлен. macOS-клиент —
+`scutil` (networksetup отказывает демонам на macOS 15+). Проверить:
 
 ```bash
 resolvectl status
 sudo bash sshtun_pool_client.sh doctor
+# macOS:
+scutil --dns
+sshtun doctor
 ```
 
 Можно отключить изменение DNS:
@@ -773,6 +853,13 @@ Linux-клиент также можно настраивать через env, 
 ```text
 install_server.sh
 sshtun_pool_client.sh
+sshtun_full.sh
+install_client.sh
+sshtun_macos.sh
+install_macos.sh
+sshtun_root.sh
+prepare_macos.sh
+sshtun_macos_client/**
 sshtun_pool_windows_client/build.ps1
 sshtun_pool_windows_client/go.mod
 sshtun_pool_windows_client/go.sum
@@ -804,7 +891,7 @@ sshtun_pool_windows_client/internal/**
 8. Добавить автообновление клиента.
 9. Вынести большие списки маршрутов, например country CIDR, в отдельный обновляемый файл/сервис. — сделано: `sshtun fetch-as` / `fetch-country` / `refresh` (2026-11-01)
 10. Добавить полноценный healthcheck: SSH connect, tunnel up, DNS, public IP, route test, packet pump stats.
-11. GUI-оболочка для Linux и macOS поверх CLI-ядра: старт/стоп туннеля, статус, просмотр логов и конфигов, вызов редактора. Планируется следующим релизом после тега текущих изменений.
+11. GUI-оболочка для Linux и macOS поверх CLI-ядра: старт/стоп туннеля, статус, просмотр логов и конфигов, вызов редактора.
 
 ## Короткая шпаргалка
 
@@ -827,6 +914,14 @@ Linux connect:
 ```bash
 sudo bash sshtun_pool_client.sh start --host SERVER_IP --key ./id_ed25519
 sudo bash sshtun_pool_client.sh stop
+```
+
+macOS connect:
+
+```bash
+sshtun up
+sudo /opt/sshtun_client/sshtun-root service-start   # досмотр launchd
+sshtun down
 ```
 
 Windows build:
