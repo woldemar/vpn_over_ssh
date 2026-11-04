@@ -91,9 +91,10 @@ func (u *utunDevice) Write(pkt []byte) error {
 		return fmt.Errorf("not an IP packet: first byte 0x%02x", pkt[0])
 	}
 	frame := make([]byte, 4+len(pkt))
-	// 4-байтовый заголовок utun — address family в HOST byte order
-	// (little-endian на Intel и Apple Silicon).
-	binary.LittleEndian.PutUint32(frame[:4], af)
+	// 4-байтовый заголовок utun — address family в NETWORK byte order
+	// (xnu на macOS 15 ожидает big-endian; little-endian пакеты видны
+	// tcpdump'ом на utun, но ядро их молча дропает — SYN-ACK не принимается).
+	binary.BigEndian.PutUint32(frame[:4], af)
 	copy(frame[4:], pkt)
 	_, err := unix.Write(u.fd, frame)
 	return err
