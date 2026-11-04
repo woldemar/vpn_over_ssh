@@ -645,9 +645,11 @@ status_vpn() {
   else
     echo "Status: stopped"
   fi
-  # остатки utun с адресами из наших сетей
-  local leftovers=""
+  # остатки utun с адресами из наших сетей (активный не считаем leftover)
+  local leftovers="" active_dev=""
+  [[ -n "$pid" ]] && active_dev="${TUN_DEV:-}"
   leftovers="$(for d in $(utun_list); do
+    [[ -n "$active_dev" && "$d" == "$active_dev" ]] && continue
     if ifconfig "$d" 2>/dev/null | grep -q "inet ${TUN_NET_A}.${TUN_NET_B}."; then printf '%s ' "$d"; fi
   done)"
   echo "Managed leftover utun devices: ${leftovers:-none}"
