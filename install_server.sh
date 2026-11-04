@@ -38,13 +38,14 @@ SYSTEM_USER="${SYSTEM_USER:-sshvpn}"
 LISTEN_PORT="${LISTEN_PORT:-65523}"
 
 # Пул tun-устройств СЕРВЕРА. Дефолт выровнен с дефолтным диапазоном
-# клиента (sshtun_full.sh: TUN_START=200, TUN_END=300): клиент просит у
+# клиента (sshtun_full.sh: TUN_START=200, TUN_END=250): клиент просит у
 # сервера устройство с ТЕМ ЖЕ номером (-w N:N), и оно обязано существовать
 # на сервере заранее (sshd от пользователя sshvpn не может создать tun
 # динамически). Если меняете диапазон клиента — меняйте и этот пул так,
-# чтобы он его накрывал.
+# чтобы он его накрывал. Диапазон 200..250: не пересекается с
+# NetworkManager (100..199) и укладывается в лимит macOS utun <=255.
 TUN_NUM_START="${TUN_NUM_START:-200}"
-TUN_POOL_SIZE="${TUN_POOL_SIZE:-101}"
+TUN_POOL_SIZE="${TUN_POOL_SIZE:-51}"
 TUN_PREFIX="${TUN_PREFIX:-tun}"
 TUN_MTU="${TUN_MTU:-1400}"
 

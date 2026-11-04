@@ -90,12 +90,16 @@ SERVER_PORT="${SERVER_PORT:-65523}"
 SSH_USER="${SSH_USER:-sshvpn}"
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/sshtun_ed25519}"
 TUN_START="${TUN_START:-200}"
-TUN_END="${TUN_END:-300}"
+TUN_END="${TUN_END:-250}"
 MTU="${MTU:-1400}"
 # Адресация туннельной пары: клиент вычисляет свою/серверную IP из номера
 # tun (как и серверный apply-network.sh). Дефолт 10.250/16 должен совпадать
 # с серверным TUN_NET_A/TUN_NET_B; сервер с другой адресацией (например,
 # второй сервер в 10.251/16) задаётся в профиле (--net-a/--net-b).
+# Диапазон tun по умолчанию 200..250 — осознанный компромисс: 0..~15
+# занимает система macOS, 100..199 может занимать NetworkManager (tun/tap
+# подключения) на Linux-хостах, а macOS не умеет utun > 255 вообще
+# («Tunnel device open failed»).
 TUN_NET_A="${TUN_NET_A:-10}"
 TUN_NET_B="${TUN_NET_B:-250}"
 
@@ -108,7 +112,29 @@ while [[ -L "$SCRIPT_PATH" ]]; do
   [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_LINK_DIR/$SCRIPT_PATH"
 done
 SCRIPT_DIR="$(cd -- "$(dirname -- "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd -P)"
-CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
+UNAME_S="${UNAME_S:-$(uname -s 2>/dev/null || echo Linux)}"
+# State-файл работающего туннеля лежит в root-only каталоге: /run на Linux,
+# /var/run на macOS (физически /private/var/run).
+RUNTIME_STATE_DIR="${RUNTIME_STATE_DIR:-/run/sshtun}"
+# Бэкенд: тот же контракт CLI/state. macOS-вариант гоняет маршруты через
+# pfctl (route-to), DNS через networksetup, lock через mkdir (flock нет).
+if [[ "$UNAME_S" == "Darwin" ]]; then
+  CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_macos.sh}"
+  RUNTIME_STATE_DIR="/var/run/sshtun"
+  MACOS_SERVICE="${MACOS_SERVICE:-com.sshtun.client}"
+  # Единственная root-точка на macOS: root-owned хелпер, разрешённый в
+  # sudoers (NOPASSWD). Прямого «sudo bash» на Darwin не вызываем никогда.
+  # Хелпер живёт в /opt (root-only); при запуске обёртки прямо из репозитория
+  # (где sshtun-root отсутствует) — fallback на /opt.
+  ROOT_HELPER="${ROOT_HELPER:-$SCRIPT_DIR/sshtun-root}"
+  [[ -f "$ROOT_HELPER" || "$UNAME_S" != "Darwin" ]] || {
+    [[ -f /opt/sshtun_client/sshtun-root ]] && ROOT_HELPER=/opt/sshtun_client/sshtun-root
+  }
+else
+  CLIENT_SCRIPT="${CLIENT_SCRIPT:-$SCRIPT_DIR/sshtun_pool_client.sh}"
+fi
+# env.conf (SSH_BIN и др.) — пишет install_macos.sh. shellcheck disable=SC1091
+[[ -f "$SCRIPT_DIR/env.conf" ]] && source "$SCRIPT_DIR/env.conf"
 
 EXCLUDES_DIR="${EXCLUDES_DIR:-$HOME/sshtun}"
 # Профили серверов: библиотека в servers/*.conf + активный server.conf.
@@ -133,18 +159,33 @@ COUNTRY_GENERATED="$GENERATED_DIR/excludes-country.txt"
 # Таблицы policy routing — должны совпадать с клиентом (он пишет их в state).
 POLICY_TABLE_DIRECT="${POLICY_TABLE_DIRECT:-200}"
 
-log(){ echo "[$(date -Is)] $*" 2>/dev/null || true; }
+# GNU date умеет -Is, BSD (macOS) — нет: собираем вручную, %z -> +HH:MM.
+ts_iso(){ date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null | sed -E 's/([0-9]{2})$/:\1/' || true; }
+log(){ echo "[$(ts_iso)] $*" 2>/dev/null || true; }
 die(){ echo "[ERROR] $*" >&2 || true; exit 1; }
 
 # Под systemd обёртка работает от root, а файлы данных должен править
 # пользователь — возвращаем владельцу ~/sshtun и читаемые права (работает
 # и для generated/: ссылка — всегда на каталог данных, не на родителя).
 restore_owner() { # path
-  chown --reference="$EXCLUDES_DIR" "$1" 2>/dev/null || true
+  # chown --reference и stat -c — GNU-специфика; на macOS stat -f.
+  local owner=""
+  owner="$(stat -c '%U:%G' "$EXCLUDES_DIR" 2>/dev/null || stat -f '%Su:%Sg' "$EXCLUDES_DIR" 2>/dev/null || true)"
+  [[ -n "$owner" ]] && chown "$owner" "$1" 2>/dev/null || true
   if [[ -d "$1" ]]; then
     chmod 0755 "$1" 2>/dev/null || true
   else
     chmod 0644 "$1" 2>/dev/null || true
+  fi
+}
+
+# sed -i на BSD требует аргумент суффикса бэкапа (sed -i '').
+sed_i() { # file expr
+  local f="$1"; shift
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    sed -i '' "$@" "$f"
+  else
+    sed -i "$@" "$f"
   fi
 }
 
@@ -201,6 +242,9 @@ EOFUSAGE
 
 check_client() {
   [[ -f "$CLIENT_SCRIPT" ]] || die "Не найден клиент: $CLIENT_SCRIPT"
+  if [[ "$UNAME_S" == "Darwin" && ! -f "$ROOT_HELPER" ]]; then
+    die "Не найден root-хелпер: $ROOT_HELPER (переустановите install_macos.sh)"
+  fi
 }
 
 check_excludes() {
@@ -214,13 +258,44 @@ check_key() {
 Затем добавить публичный ключ на сервер в /opt/sshtun_pool/authorized_keys"
 }
 
-# 1 — туннель работает, 0 — нет. State-файл лежит в /run/sshtun (root-only).
-# kill -0 не подходит: sshd-клиент работает от root, и обычный пользователь
-# получает EPERM. Проверяем через /proc (читаем всем при стандартном hidepid).
+# 1 — туннель работает, 0 — нет. State-файл лежит в root-only каталоге
+# (RUNTIME_STATE_DIR). kill -0 не подходит: sshd-клиент работает от root, и
+# обычный пользователь получает EPERM. Linux: /proc (читаем всем при
+# стандартном hidepid); macOS: ps видит чужие процессы.
+# shellcheck disable=SC1090
+state_var() { # VAR... -> значения через пробел
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    sudo -n "$ROOT_HELPER" state-var "$@" 2>/dev/null || true
+    return 0
+  fi
+  sudo -n bash -c '
+    s="$1"; shift
+    source "$s" 2>/dev/null
+    while (($#)); do
+      eval "printf \"%s\" \"\${$1:-}\""
+      shift
+      (($# > 0)) && printf " "
+    done
+  ' _ "$RUNTIME_STATE_DIR/state" "$@" 2>/dev/null || true
+}
+
+# Запуск подкоманд бэкенда с правами root.
+client_cmd() { # args...
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    sudo -n "$ROOT_HELPER" backend-run "$@"
+  else
+    sudo bash "$CLIENT_SCRIPT" "$@"
+  fi
+}
+
 tun_is_running() {
   local pid=""
-  pid="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${SSH_PID:-}"' 2>/dev/null || true)"
+  pid="$(state_var SSH_PID)"
   [[ -n "$pid" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    ps -p "$pid" -o pid= >/dev/null 2>&1
+    return $?
+  fi
   [[ -d "/proc/$pid" ]] && return 0
   kill -0 "$pid" 2>/dev/null
 }
@@ -457,7 +532,7 @@ server_rename() { # old new
   [[ ! -f "$dst" ]] || die "Профиль '$new' уже существует: $dst"
   # Шапку профиля (строки с комментариями) приводим к новому имени —
   # там шаблонные 'server OLD' и 'server use OLD'. Содержимое не трогаем.
-  sed -i "/^#/s/'$old'/'$new'/g; /^#/s/use $old\$/use $new/" "$src"
+  sed_i "$src" "/^#/s/'$old'/'$new'/g; /^#/s/use $old\$/use $new/"
   mv -f "$src" "$dst"
   restore_owner "$dst"
   if [[ "$(active_profile)" == "$old" ]]; then
@@ -470,6 +545,15 @@ server_rename() { # old new
   fi
 }
 
+# Содержимое активного server.conf совпадает с профилем (без двух строк
+# служебной шапки)? Нужно, чтобы 'server use' замечал ручные правки
+# профиля после активации и переустанавливал конфиг, а не молчал «уже активен».
+profile_is_active_content() { # name -> 0 если server.conf == профиль
+  local src="$SERVERS_DIR/$1.conf"
+  [[ -f "$SERVER_CONF" && -f "$src" ]] || return 1
+  diff -q <(tail -n +3 "$SERVER_CONF") "$src" >/dev/null 2>&1
+}
+
 server_use() {
   local name="${1:-}"
   [[ -n "$name" ]] || die "Укажите имя профиля: $0 server use NAME (список: sshtun server list)"
@@ -478,7 +562,7 @@ server_use() {
   local host=""
   host="$(conf_key "$src" SERVER_HOST)"
   [[ -n "$host" ]] || die "В профиле '$name' нет SERVER_HOST: $src"
-  if [[ "$(active_profile)" == "$name" ]]; then
+  if [[ "$(active_profile)" == "$name" ]] && profile_is_active_content "$name"; then
     log "Профиль '$name' уже активен ($host)"
     return 0
   fi
@@ -548,6 +632,15 @@ apply_direct_changes() {
 
   if ! tun_is_running; then
     log "Туннель не работает — маршруты подхватятся при следующем 'up'"
+    return 0
+  fi
+
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    # macOS: diff не нужен — бэкенд пересобирает pf-таблицы из файлов политики
+    # (exclude-файлы обёртка уже перезаписала).
+    printf '%s\n' "${ops[@]}" | sudo -n "$ROOT_HELPER" backend-run apply-diff \
+      && log "Применено изменений маршрутов: ${#ops[@]}" \
+      || log "WARNING: apply-diff не удался"
     return 0
   fi
 
@@ -621,10 +714,17 @@ apply_force_changes() {
   fi
 
   local rt tdev tip table
-  rt="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s %s %s" "${TUN_DEV:-}" "${SERVER_TUN_IP:-}" "${POLICY_TABLE_DIRECT:-200}"' 2>/dev/null || true)"
+  rt="$(state_var TUN_DEV SERVER_TUN_IP POLICY_TABLE_DIRECT)"
   tdev="${rt%% *}"
   tip="$(awk '{print $2}' <<<"$rt")"
   table="$(awk '{print $3}' <<<"$rt")"
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    # macOS: diff не нужен — бэкенд пересобирает pf-таблицы из файлов политики.
+    printf '%s\n' "${ops[@]}" | sudo -n "$ROOT_HELPER" backend-run apply-diff \
+      && log "Применено изменений force-маршрутов: ${#ops[@]}" \
+      || log "WARNING: apply-diff не удался"
+    return 0
+  fi
   if [[ -z "$tdev" || -z "$tip" || -z "$table" ]]; then
     log "Не прочитано состояние туннеля — маршруты подхватятся при следующем 'up'"
     return 0
@@ -656,7 +756,7 @@ apply_force_changes() {
 # иначе env/default. Маршруты include/exclude живут в этой таблице.
 policy_table_direct_runtime() {
   local t=""
-  t="$(sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${POLICY_TABLE_DIRECT:-}"' 2>/dev/null || true)"
+  t="$(state_var POLICY_TABLE_DIRECT)"
   [[ -n "$t" ]] && printf '%s' "$t" || printf '%s' "$POLICY_TABLE_DIRECT"
 }
 
@@ -809,7 +909,7 @@ migrate_legacy_inline() { # src_token_file dst_generated
     echo "# SSHTUN: АВТОГЕНЕРАЦИЯ (мигрировано из старого формата офлайн; данные"
     echo "# могут быть устаревшими — выполните 'sshtun refresh' при появлении сети)."
     echo "# Источники: $(file_sources "$src")"
-    echo "# Обновлено: $(date -Is) (offline-migration)"
+    echo "# Обновлено: $(ts_iso) (offline-migration)"
     printf '%s\n' "$prefixes"
   } > "$dst"
   restore_owner "$dst"
@@ -821,6 +921,55 @@ migrate_legacy_inline() { # src_token_file dst_generated
 # — старые файлы с инлайн-префиксами так перекачиваются при первом же 'up'.
 # Токены есть: refresh (при неудаче — fallback на кэш, иначе legacy-миграция,
 # иначе die). Источников нет: подхватим legacy-инлайн, если файл старого формата.
+#
+# Автообновление при 'up' — не чаще раза в AUTOGEN_TTL_SEC: каждый рестарт
+# службы иначе блокируется на последовательных сетевых загрузках (RIPEstat/
+# ipdeny, до --max-time на каждую), а для дневных зон это свежесть не добавляет.
+# 'sshtun refresh' обновляет принудительно (SSHTUN_FORCE_REFRESH=1 — тоже).
+AUTOGEN_TTL_SEC="${AUTOGEN_TTL_SEC:-43200}"
+
+autogen_fresh() {
+  local newest=0 f m
+  for f in "$AS_GENERATED" "$COUNTRY_GENERATED"; do
+    [[ -f "$f" ]] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+    [[ "$m" =~ ^[0-9]+$ ]] || continue
+    (( m > newest )) && newest=$m
+  done
+  (( newest > 0 && $(date +%s) - newest < AUTOGEN_TTL_SEC ))
+}
+
+# Человекочитаемый возраст: N сек / N мин / N ч / N дн.
+fmt_age() { # seconds
+  local s="$1"
+  (( s < 90 )) && { printf '%d сек' "$s"; return; }
+  (( s < 5400 )) && { printf '%d мин' $((s / 60)); return; }
+  (( s < 129600 )) && { printf '%d ч' $((s / 3600)); return; }
+  printf '%d дн' $((s / 86400))
+}
+
+# Строка для 'sshtun status': насколько свежи автогенные списки и как их
+# принудительно обновить (раньше обновление при старте было видно в логе,
+# теперь оно TTL-gated и «невидимо» — статус должен объяснять состояние).
+autogen_status() {
+  local newest=0 f m
+  for f in "$AS_GENERATED" "$COUNTRY_GENERATED"; do
+    [[ -f "$f" ]] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+    [[ "$m" =~ ^[0-9]+$ ]] && (( m > newest )) && newest=$m
+  done
+  if (( newest == 0 )); then
+    echo "Списки AS/стран: кэша нет — при первом старте скачаются (принудительно: sshtun refresh)"
+    return
+  fi
+  local age=$(( $(date +%s) - newest ))
+  if (( age < AUTOGEN_TTL_SEC )); then
+    echo "Списки AS/стран: свежи ($(fmt_age "$age") назад; автообновление раз в $((AUTOGEN_TTL_SEC / 3600)) ч, принудительно: sshtun refresh)"
+  else
+    echo "Списки AS/стран: УСТАРЕЛИ ($(fmt_age "$age") назад; обновите: sshtun refresh)"
+  fi
+}
+
 ensure_autogen() {
   local need=0
   local srcs=""
@@ -831,6 +980,10 @@ ensure_autogen() {
   if (( need == 0 )); then
     migrate_legacy_inline "$AS_EXCLUDES" "$AS_GENERATED"
     migrate_legacy_inline "$COUNTRY_EXCLUDES" "$COUNTRY_GENERATED"
+    return 0
+  fi
+  if [[ "${SSHTUN_FORCE_REFRESH:-0}" != "1" ]] && autogen_fresh; then
+    log "Автогенные списки свежи (младше $((AUTOGEN_TTL_SEC / 3600)) ч) — сетевое обновление пропущено; принудительно: sshtun refresh"
     return 0
   fi
   if refresh_lists; then
@@ -910,7 +1063,9 @@ start_vpn() {
   # Дефолт — ЧЕРЕЗ СЛУЖБУ. Иначе фоновый запуск без досмотра оставляет
   # «stale state» после сна/обрыва (некому перезапустить ssh). Фон без
   # досмотра — только явный 'up --background'.
-  if (( ! background && ! foreground )); then
+  # На macOS служба — launchd (своя логика supervisor_*), systemd нет:
+  # блок целиком только для Linux.
+  if [[ "$UNAME_S" != "Darwin" ]] && (( ! background && ! foreground )); then
     if systemd_unit_available; then
       if env_overrides_present; then
         log "Параметры заданы через env — в systemd-юнит они не попадут;"
@@ -951,8 +1106,18 @@ start_vpn() {
     # SUPERVISED=1 в state). TUN_NET_* пробрасываем через env: sudo по
     # умолчанию сбрасывает окружение, а клиент считает IP-пару из него.
     args+=(--foreground)
+    if [[ "$UNAME_S" == "Darwin" ]]; then
+      # env TUN_NET_* проходят через Defaults env_keep (sudoers) в хелпер.
+      exec env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+        sudo -n "$ROOT_HELPER" backend-run start "${args[@]}"
+    fi
     exec sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
       bash "$CLIENT_SCRIPT" start "${args[@]}"
+  fi
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
+      sudo -n "$ROOT_HELPER" backend-run start "${args[@]}"
+    return $?
   fi
   sudo env TUN_NET_A="$TUN_NET_A" TUN_NET_B="$TUN_NET_B" \
     bash "$CLIENT_SCRIPT" start "${args[@]}"
@@ -960,25 +1125,44 @@ start_vpn() {
 
 # Маркер SUPERVISED из state работающего туннеля ("1" — под досмотром systemd).
 supervised_marker() {
-  sudo -n bash -c 'source /run/sshtun/state 2>/dev/null; printf "%s" "${SUPERVISED:-0}"' 2>/dev/null || true
+  state_var SUPERVISED
+}
+
+# Остановка туннеля, поднятого службой досмотра (systemd / launchd).
+supervisor_stop() {
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    log "Туннель под досмотром launchd — останавливаю: bootout $MACOS_SERVICE"
+    sudo -n "$ROOT_HELPER" service-stop
+  else
+    log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
+    sudo -n systemctl stop sshtun
+  fi
+}
+
+supervisor_restart() {
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    log "Туннель под досмотром launchd — перезапускаю: kickstart -k $MACOS_SERVICE"
+    sudo -n "$ROOT_HELPER" service-restart
+  else
+    log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
+    sudo -n systemctl restart sshtun
+  fi
 }
 
 stop_vpn() {
   check_client
-  # Туннель под досмотром systemd (маркер SUPERVISED=1 в state): останавливаем
-  # ЧЕРЕЗ systemctl — иначе Restart=always перезапустил бы его после down.
+  # Туннель под досмотром службы (маркер SUPERVISED=1 в state): останавливаем
+  # ЧЕРЕЗ неё — иначе политика перезапуска вернула бы его после down.
   if [[ "$(supervised_marker)" == "1" ]]; then
-    log "Туннель под досмотром systemd — останавливаю службу: systemctl stop sshtun"
-    sudo -n systemctl stop sshtun
+    supervisor_stop
     return
   fi
-  sudo bash "$CLIENT_SCRIPT" stop
+  client_cmd stop
 }
 
 restart_vpn() {
   if [[ "$(supervised_marker)" == "1" ]]; then
-    log "Туннель под досмотром systemd — перезапускаю службу: systemctl restart sshtun"
-    sudo -n systemctl restart sshtun
+    supervisor_restart
     return
   fi
   stop_vpn || true
@@ -1199,7 +1383,7 @@ write_managed_file() {
     echo "# Источники-ТОКЕНЫ лежат отдельно (~/sshtun/excludes-as.txt, excludes-country.txt)."
     echo "# Источники: $sources"
     echo "# Данные: $datasource"
-    echo "# Обновлено: $(date -Is)"
+    echo "# Обновлено: $(ts_iso)"
     echo "# sshtun-managed-sources: $sources"
     grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$' | sort -u
   } > "$tmp"
@@ -1501,9 +1685,9 @@ case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
   down|stop)       shift; stop_vpn "$@" ;;
   restart)         shift; restart_vpn "$@" ;;
-  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; sudo bash "$CLIENT_SCRIPT" status "$@" ;;
-  doctor)          shift; check_client; sudo bash "$CLIENT_SCRIPT" doctor "$@" ;;
-  cleanup)         shift; check_client; sudo bash "$CLIENT_SCRIPT" cleanup "$@" ;;
+  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; autogen_status; client_cmd status "$@" ;;
+  doctor)          shift; check_client; client_cmd doctor "$@" ;;
+  cleanup)         shift; check_client; client_cmd cleanup "$@" ;;
   exclude)
     shift
     [[ $# -ge 1 ]] || die "Укажите подкоманду: $0 exclude add|del CIDR..."
