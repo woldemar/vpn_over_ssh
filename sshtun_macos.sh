@@ -474,23 +474,30 @@ start_vpn() {
   # utun). Поиск: env.conf/переменная → каталог скрипта → ~/sshtun-tools
   # пользователя (sudo сохраняет SUDO_USER; под launchd без SUDO_USER
   # работает env.conf).
+  # Архитектура: в репо лежат обе сборки (Intel/Apple Silicon), выбираем
+  # под uname -m; имя без суффикса — legacy-единичная сборка (фолбэком).
   if [[ -z "${TUN_GO_BIN:-}" ]]; then
-    local _uh=""
+    local _uh="" _c="" _sfx=""
     _uh="$(eval echo "~${SUDO_USER:-$USER}" 2>/dev/null || true)"
-    # Пользовательская сборка в приоритете: обновление бинаря без root.
-    if [[ -n "$_uh" && -x "$_uh/sshtun-tools/bin/sshtun-macos-tun" ]]; then
-      TUN_GO_BIN="$_uh/sshtun-tools/bin/sshtun-macos-tun"
-    elif [[ -x "$SCRIPT_DIR_MACOS/sshtun-macos-tun" ]]; then
-      TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun-macos-tun"
-    elif [[ -x "$SCRIPT_DIR_MACOS/sshtun_macos_client/sshtun-macos-tun" ]]; then
-      # бинарь живёт в подкаталоге репо (кросс-сборка Linux->darwin);
-      # для службы от root это путь свежее /opt-копии (обновляется git pull)
-      TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun_macos_client/sshtun-macos-tun"
-    elif [[ -x "/opt/sshtun_client/sshtun-macos-tun" ]]; then
-      # служба launchd идёт ОТ ROOT (HOME=/var/root, user-local недостижим):
-      # installer кладёт бинарь сюда — надёжный путь для службы без репо.
-      TUN_GO_BIN="/opt/sshtun_client/sshtun-macos-tun"
-    fi
+    case "$(uname -m 2>/dev/null || echo x86_64)" in
+      arm64|aarch64) _sfx="arm64" ;;
+      *) _sfx="amd64" ;;
+    esac
+    # проход 1: бинарь под архитектуру хоста; проход 2: legacy без суффикса
+    for _c in \
+      "$_uh/sshtun-tools/bin/sshtun-macos-tun.$_sfx" \
+      "$SCRIPT_DIR_MACOS/sshtun-macos-tun.$_sfx" \
+      "$SCRIPT_DIR_MACOS/sshtun_macos_client/sshtun-macos-tun.$_sfx" \
+      "/opt/sshtun_client/sshtun-macos-tun.$_sfx" \
+      "$_uh/sshtun-tools/bin/sshtun-macos-tun" \
+      "$SCRIPT_DIR_MACOS/sshtun-macos-tun" \
+      "$SCRIPT_DIR_MACOS/sshtun_macos_client/sshtun-macos-tun" \
+      "/opt/sshtun_client/sshtun-macos-tun"; do
+      [[ -x "$_c" ]] || continue
+      # Пользовательская сборка в приоритете: обновление бинаря без root.
+      TUN_GO_BIN="$_c"
+      break
+    done
   fi
 
   if [[ -n "${TUN_GO_BIN:-}" ]]; then
