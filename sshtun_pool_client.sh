@@ -694,11 +694,13 @@ stop_vpn() {
 }
 
 status_vpn() {
+  local active_dev=""
   if [[ ! -f "$STATE_FILE" ]]; then
     echo "Status: stopped"
   else
     load_state_if_exists || true
     if [[ -n "${SSH_PID:-}" ]] && kill -0 "$SSH_PID" >/dev/null 2>&1; then
+      active_dev="${TUN_DEV:-}"
       echo "Status: running"
       echo "PID: $SSH_PID"
       echo "Server: ${SSH_USER}@${HOST}:${SSH_PORT}"
@@ -715,8 +717,17 @@ status_vpn() {
     fi
   fi
 
+  # Активный tun не «leftover»: исключаем его, чтобы не пугать строкой
+  # «Managed leftover» при живом туннеле (признаки остаются полезны только
+  # в stopped/stale-ветках — там active_dev пуст и фильтра нет).
   local leftovers=""
-  leftovers="$(list_owned_tuns | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
+  if [[ -n "$active_dev" ]]; then
+    # awk вместо grep -v: при пустом выводе list_owned_tuns grep дал бы
+    # exit 1, и pipefail (set -e) ронял бы status.
+    leftovers="$(list_owned_tuns | awk -v d="$active_dev" '$0 != d' | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
+  else
+    leftovers="$(list_owned_tuns | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')"
+  fi
   if [[ -n "$leftovers" ]]; then
     echo "Managed leftover tun devices: $leftovers"
   else

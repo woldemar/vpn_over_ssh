@@ -23,9 +23,13 @@ IFS=$'\n\t'
 # побеждает независимо от файла. На равных префиксах побеждает force-файл.
 #
 # Команды:
-#   up | start          поднять туннель
+#   up | start          поднять туннель; если установлен systemd-юнит
+#                       sshtun.service — ЧЕРЕЗ СЛУЖБУ (с досмотром: переживёт
+#                       сон/обрыв/рестарт сервера), иначе напрямую
+#   up --background     поднять напрямую, БЕЗ досмотра (только явный запрос:
+#                       после сна/обрыва такой туннель сам не переподнимется)
 #   up --foreground     поднять и не выходить (режим systemd: досмотр ssh,
-#                       при падении — exit 1 для Restart=on-failure)
+#                       при падении — exit 1 для Restart=always)
 #   down | stop         остановить
 #   restart             переподнять
 #   status              состояние
@@ -188,7 +192,10 @@ sed_i() { # file expr
 usage() {
   cat <<EOFUSAGE
 Использование:
-  $0 up                 поднять туннель (full-tunnel + исключения)
+  $0 up                 поднять туннель (full-tunnel + исключения); если
+                        установлен systemd-юнит sshtun — ЧЕРЕЗ СЛУЖБУ (досмотр:
+                        переживёт сон/обрыв). Без досмотра: up --background
+  $0 up --background    поднять напрямую, без досмотра (после сна сам не поднимется)
   $0 down               остановить
   $0 restart            переподнять
   $0 status             состояние
@@ -943,9 +950,49 @@ ensure_autogen() {
   die "Префиксы AS/стран недоступны: нет сети и нет кэша в $GENERATED_DIR"
 }
 
+# systemd-юнит sshtun.service установлен (LoadState=loaded) и systemd жив.
+systemd_unit_available() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  [[ -d /run/systemd/system ]] || return 1
+  [[ "$(systemctl show -p LoadState --value sshtun.service 2>/dev/null)" == "loaded" ]]
+}
+
+# Параметры, переданные через env: юнит имеет фиксированный Environment и их
+# не увидит — такой запуск делаем напрямую, без маршрута через службу.
+env_overrides_present() {
+  local v
+  for v in "$SERVER_HOST_FROM_ENV" "$SERVER_PORT_FROM_ENV" "$SSH_USER_FROM_ENV" \
+           "$KEY_FILE_FROM_ENV" "$TUN_START_FROM_ENV" "$TUN_END_FROM_ENV" \
+           "$MTU_FROM_ENV" "$TUN_NET_A_FROM_ENV" "$TUN_NET_B_FROM_ENV"; do
+    [[ -n "$v" ]] && return 0
+  done
+  return 1
+}
+
+# Старт через службу: супервизор внутри юнита (up --foreground) видит смерть
+# ssh и возвращает failure -> systemd перезапускает (Restart=always). Так
+# туннель переживает сон ноутбука, обрыв сети и рестарт сервера.
+start_via_systemd() {
+  log "Поднимаю туннель службой sshtun (досмотр systemd)"
+  sudo -n systemctl start sshtun
+  # systemctl стартует юнит асинхронно: дожидаемся живого SSH_PID в state
+  # (обычно ~10-15 с: autogen-списки + ssh-handshake) и показываем статус.
+  local i
+  for ((i = 0; i < 60; i++)); do
+    if tun_is_running; then
+      printf 'Профиль: %s\n' "$(profile_display)"
+      sudo bash "$CLIENT_SCRIPT" status
+      return 0
+    fi
+    sleep 2
+  done
+  die "Служба sshtun не подняла туннель за 120 с. Журнал: sudo journalctl -u sshtun -e --no-pager"
+}
+
 start_vpn() {
-  local foreground=0
+  local foreground=0 background=0
   [[ "${1:-}" == "--foreground" ]] && foreground=1
+  [[ "${1:-}" == "--background" ]] && background=1
   [[ -n "$SERVER_HOST" ]] || die "SERVER_HOST не задан. Укажите адрес сервера:
   - через профиль: sshtun server add NAME HOST && sshtun server use NAME, или
   - в файле $SERVER_CONF (строка SERVER_HOST=your-server), или
@@ -960,6 +1007,23 @@ start_vpn() {
   check_client
   check_excludes
   check_key
+  # Дефолт — ЧЕРЕЗ СЛУЖБУ. Иначе фоновый запуск без досмотра оставляет
+  # «stale state» после сна/обрыва (некому перезапустить ssh). Фон без
+  # досмотра — только явный 'up --background'.
+  if (( ! background && ! foreground )); then
+    if systemd_unit_available; then
+      if env_overrides_present; then
+        log "Параметры заданы через env — в systemd-юнит они не попадут;"
+        log "поднимаю напрямую (без досмотра). Для досмотра настройте профиль: sshtun server add/use"
+      else
+        start_via_systemd
+        return $?
+      fi
+    else
+      log "WARNING: systemd-юнит sshtun.service не найден — поднимаю напрямую,"
+      log "без досмотра (после сна/обрыва сам не переподнимется). Юнит ставит install_client.sh"
+    fi
+  fi
   # Токены AS/стран разворачиваем в префиксы (generated/) перед стартом.
   # Нет сети — используем кэш, если он есть (иначе мигрируем legacy инлайн).
   ensure_autogen
