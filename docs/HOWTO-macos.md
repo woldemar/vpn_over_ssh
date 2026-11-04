@@ -7,32 +7,46 @@ full-tunnel через SSH (ssh -w / utun), исключения (exclude), пр
 
 ## Как это устроено (отличия от Linux)
 
-- Маршрутная политика — **pfctl**, а не policy-routing таблицы: exclude/include
-  префиксы живут в pf-таблицах, catch-all идёт `route-to` в utun.
-  Main routing table macOS не трогается вообще.
-- Семантика префиксов та же: pf выбирает самый длинный префикс (LPM), на
-  равных длинах include побеждает exclude (порядок quick-правил).
-- DNS: `networksetup` per-service (Wi-Fi), старые значения сохраняются и
-  восстанавливаются при stop.
+- **Data-plane — собственный Go-бинарь** (`sshtun_macos_client/sshtun-macos-tun`,
+  кросс-сборка Linux→darwin, лежит в репо и копируется installer'ом в
+  /opt): реализует wire-протокол `tun@openssh.com` в userspace поверх
+  x/crypto/ssh и управляет utun напрямую через сисколлы. Причина: ни Apple
+  ssh, ни portable OpenSSH **вообще не умеют** utun (проверено: «Tunnel
+  device open failed»; в openssh-portable нет utun-кода). Фолбэк «ssh -w»
+  в бэкенде на macOS неработоспособен — бинарь обязателен.
+- **Маршрутная политика — pfctl**, а не policy-routing таблицы: exclude/
+  include префиксы живут в pf-таблицах (~12k+ записей за секунды), include
+  идёт `route-to` в utun, catch-all — двумя полу-default'ами в таблице
+  маршрутизации (`0.0.0.0/1` + `128.0.0.0/1` через peer utun; macOS
+  route(8) не ест CIDR-форму `/1` — только `-netmask 128.0.0.0`).
+  Для самого ssh-соединения бэкенд ставит **хост-маршрут /32 до сервера
+  через дефолтный шлюз** — иначе /1'ы перехватывают и его.
+- Семантика префиксов та же: LPM, на равных длинах include побеждает
+  exclude (порядок quick-правил).
+- **DNS: scutil** (networksetup отказывает демонам на macOS 15+), старые
+  значения сохраняются в state и восстанавливаются при stop.
 - Блок IPv6-трафика — правилом pf (вместо blackhole-маршрутов).
 - State: `/var/run/sshtun` (аналог `/run/sshtun`).
-- Требование: **bash >= 4.3** (системный bash 3.2 macOS не подходит —
-  обёртка использует nameref/ассоциативные массивы). Ставится через brew;
-  launchd-окружение выставляет PATH с приоритетом brew.
+- Требование: **bash >= 4.3** (системный bash 3.2 macOS не подходит).
+  Все root-операции идут через root-хелпер `/opt/sshtun_client/sshtun-root`
+  (единственная NOPASSWD-команда в sudoers); прямого «sudo bash» бэкенд
+  не вызывает никогда.
 
 ## 0. Требования
 
 - macOS Sonoma/Sequoia (Intel).
-- **bash >= 4.3** и **ssh с поддержкой `-w`/utun** — системный bash 3.2 и
-  Apple ssh (`/usr/bin/ssh`) НЕ подходят: bash 3.2 не умеет nameref/assoc-
-  arrays, а Apple ssh падает «Tunnel device open failed». Сборка без brew,
-  без root (нужен Xcode CLT):
+- **bash >= 4.3** — системный bash 3.2 не подходит (nameref/assoc-arrays).
+  Без brew, без root (нужен Xcode CLT):
   ```bash
   bash prepare_macos.sh   # bash + LibreSSL + OpenSSH -> ~/sshtun-tools
   ```
-  (если brew установлен, подойдут `brew install bash openssh`).
+  (если brew установлен, подойдёт `brew install bash openssh`.)
 - `xcode-select --install` (python3/dig — из CLT).
-- Установщик сам найдёт подходящие bash/ssh и запишет путь к ssh в
+- Data-plane-бинарь `sshtun-macos-tun` идёт в репозитории (кросс-сборка
+  `CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build`); installer кладёт его
+  в /opt/sshtun_client. Свежая сборка по LAN: scp в `~/sshtun-tools/bin/`
+  (бэкенд ищет сначала там — обновление без root).
+- Установщик сам найдёт подходящие bash/ssh и запишет пути в
   `/opt/sshtun_client/env.conf`; шим `/usr/local/bin/sshtun` жёстко
   привязан к нужному bash.
 
@@ -98,18 +112,22 @@ sshtun refresh
 ## 5. Служба (launchd): досмотр и автостарт
 
 ```bash
-# включить досмотр (KeepAlive: падение ssh -> переподъём ~секунды)
-sudo launchctl bootstrap system /Library/LaunchDaemons/com.sshtun.client.plist
-sshtun down        # идёт через launchctl bootout (маркер SUPERVISED)
+# включить досмотр (KeepAlive: падение ssh/обрыв/сон -> переподъём)
+sudo /opt/sshtun_client/sshtun-root service-start   # bootout+bootstrap
+sshtun down        # идёт через launchctl bootout (маркер SUPERVISED=1)
 
-# автостарт при загрузке
+# автостарт при загрузке (после этого служба грузится сама при каждой загрузке)
 sudo defaults write /Library/LaunchDaemons/com.sshtun.client.plist RunAtLoad -bool true
 
 # выключить
-sudo launchctl bootout system/com.sshtun.client
+sudo /opt/sshtun_client/sshtun-root service-stop    # или: launchctl bootout system/com.sshtun.client
 
 tail -f /var/log/sshtun.log
 ```
+
+Служба идёт **от root**: пути к данным и ключу зашиты в plist
+(`EXCLUDES_DIR`/`KEY_FILE`), бинарь data-plane ищется в
+`/opt/sshtun_client` (и в `sshtun_macos_client/` рядом с репозиторием).
 
 ## 6. Сон ноутбука (главный сценарий)
 
@@ -123,7 +141,9 @@ sshtun status                   # поднялся сам (KeepAlive)
 ## 7. Диагностика
 
 ```bash
-sshtun doctor                   # state, pf, utun, DNS
+sshtun doctor                   # state, pf (rules/таблицы/счётчики), utun, DNS
+sudo /opt/sshtun_client/sshtun-root backend-run pfprobe
+                                # маршруты, pf states, счётчики правил, forwarding
 sudo pfctl -s info              # pf включён?
 cat /etc/pf.conf | grep sshtun  # anchor "com.sshtun" на месте?
 sudo pfctl -a com.sshtun -s rules
@@ -139,16 +159,19 @@ sshtun cleanup                  # снести остатки после сбо�
   запрошенный номер).
 - DNS не восстановился после down → `networksetup -setdnsservers Wi-Fi Empty`
   (или значения из бэкапа в `sshtun doctor`).
+- Туннель живёт ~90 с и умирает → проверьте `route -n get <IP-сервера>`:
+  должен идти через физический шлюз, а НЕ через utun (bypass /32 ставит
+  бэкенд; без него catch-all /1-хавает сам ssh-поток).
 
-## 8. Чек-лист готовности порта
+## 8. Чек-лист готовности порта (пройден 04.11.2026, macOS 15.8.2 Intel)
 
-- [ ] `sshtun up/down/restart/status/doctor` работают на macOS (Intel)
-- [ ] full-tunnel: `curl ifconfig.me` показывает сервер; `route -n get default` НЕ изменён
-- [ ] exclude/include: pf-таблицы обновляются без перезапуска (§4)
-- [ ] DNS: `scutil --dns` = 1.1.1.1/8.8.8.8 при работе; восстановлены после down
-- [ ] fetch/refresh/--remove: токены и `generated/` как на Linux
-- [ ] мультисервер: `server add/use/rename`, сокращение `sshtun fin`
-- [ ] служба: kill ssh → рестарт; `sshtun down` без рестарта (§5)
-- [ ] сон → самовосстановление (§6)
-- [ ] `install/uninstall/reinstall`: файлы, plist, anchor; данные не теряются
-- [ ] лог службы: `tail -f /var/log/sshtun.log`
+- [x] `sshtun up/down/restart/status/doctor` работают на macOS (Intel)
+- [x] full-tunnel: `curl ifconfig.me` показывает сервер; `route -n get default` НЕ изменён
+- [x] exclude/include: pf-таблицы обновляются без перезапуска (§4)
+- [x] DNS: `scutil --dns` = 1.1.1.1/8.8.8.8 при работе; восстановлены после down
+- [x] fetch/refresh/--remove: токены и `generated/` как на Linux
+- [x] мультисервер: `server add/use/rename`, сокращение `sshtun fin`
+- [x] служба: kill ssh → рестарт; `sshtun down` без рестарта (§5)
+- [x] сон → самовосстановление (§6)
+- [x] `install/uninstall/reinstall`: файлы, plist, anchor; данные не теряются
+- [x] лог службы: `tail -f /var/log/sshtun.log`

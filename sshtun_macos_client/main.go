@@ -152,20 +152,10 @@ func dial(addr string, cfg *ssh.ClientConfig, timeout time.Duration) (*ssh.Clien
 		_ = conn.Close()
 		return nil, err
 	}
-	client := ssh.NewClient(c, chans, reqs)
-	// Глобальные запросы соединения (keepalive@openssh.com от sshd по
-	// ClientAliveInterval) обязаны получать ответ — иначе сервер рвёт
-	// сессию ("Timeout, client not responding" в логах sshd). Временно
-	// логируем каждый запрос для диагностики.
-	go func() {
-		for r := range reqs {
-			log.Printf("global request: %s want_reply=%v", r.Type, r.WantReply)
-			if r.WantReply {
-				_ = r.Reply(false, nil)
-			}
-		}
-	}()
-	return client, nil
+	// reqs отдаём NewClient: он сам обслуживает глобальные запросы
+	// (keepalive@openssh.com от sshd по ClientAliveInterval) и отвечает
+	// на want-reply — отдельный диспетчер не нужен.
+	return ssh.NewClient(c, chans, reqs), nil
 }
 
 func loadSigner(path string) (ssh.Signer, error) {
