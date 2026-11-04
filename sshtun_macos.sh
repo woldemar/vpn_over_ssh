@@ -210,7 +210,9 @@ pf_write_anchor() { # правила с подставленным utun/peer
     # 4 обратно). Вместо этого catch-all просто пропускаем, а в туннель
     # трафик заворачивают ДВА ПОЛУ-DEFAULT'а в таблице маршрутизации
     # (0.0.0.0/1 + 128.0.0.0/1 via peer — добавляет бэкенд): тогда src
-    # выбирает ядро адресом utun — как на Linux.
+    # выбирает ядро адресом utun — как на Linux. ВАЖНО: при этом /1'ы
+    # захватывают и сам ssh-поток к серверу — ему бэкенд отдельно ставит
+    # хост-маршрут /32 через дефолтный шлюз (add_server_bypass_route).
     printf 'pass out quick route-to (%s %s) inet from any to <sshtun_includes>\n' "$TUN_DEV" "$SERVER_TUN_IP"
     printf 'pass out quick inet from any to <sshtun_excludes>\n'
     printf 'pass out quick inet from any to <sshtun_bypass>\n'
@@ -281,6 +283,21 @@ add_tunnel_routes() {
 del_tunnel_routes() {
   route -q delete -net 0.0.0.0 -netmask 128.0.0.0 "$SERVER_TUN_IP" >/dev/null 2>&1 || true
   route -q delete -net 128.0.0.0 -netmask 128.0.0.0 "$SERVER_TUN_IP" >/dev/null 2>&1 || true
+}
+
+# Хост-маршрут до СЕРВЕРА через дефолтный шлюз. КРИТИЧНО: полу-default'ы
+# (/1 в utun) иначе перехватывают и сам ssh-поток — кэш маршрута у сокета
+# живёт недолго, и через ~30 с внешнее ssh-соединение начинает ходить в utun
+# (пакеты возвращаются data-plane'у внутрь процесса и глохнут: сервер шлёт
+# keepalive и не получает ACK, «Timeout, client not responding» ~T+90).
+# Паритет с Linux-клиентом: там add_server_bypass_route есть с самого начала.
+add_server_bypass_route() {
+  route -q add -host "$SERVER_REAL_IP" "$DEFAULT_GW" >/dev/null 2>&1 \
+    || log "WARNING: bypass-маршрут до сервера не добавлен (route add rc=$?)"
+}
+
+del_server_bypass_route() {
+  route -q delete -host "$SERVER_REAL_IP" "$DEFAULT_GW" >/dev/null 2>&1 || true
 }
 
 # Живое применение diff'ов от обёртки: пересобираем таблицы из файлов
@@ -525,9 +542,10 @@ start_vpn() {
   ifconfig "$TUN_DEV" inet "$CLIENT_TUN_IP" "$SERVER_TUN_IP" mtu "$TUN_MTU" up \
     || die "ifconfig $TUN_DEV не удался"
 
-  # маршрутная политика (pf + полу-default'а в таблице)
+  # маршрутная политика (pf + полу-default'а в таблице + bypass до сервера)
   pf_load_anchor
   add_tunnel_routes
+  add_server_bypass_route
   log "pf anchor $PF_ANCHOR_NAME загружен ($TUN_DEV -> $SERVER_TUN_IP)"
 
   # state пишем ДО dns_save_and_set: та ДОПИСЫВАЕТ DNS_* в конец файла,
@@ -565,6 +583,7 @@ stop_cleanup() {
   # DNS восстанавливаем ПЕРВЫМ (пока есть state)
   if [[ -f "$STATE_FILE" ]]; then
     dns_restore || true
+    del_server_bypass_route || true
     del_tunnel_routes || true
   fi
 
