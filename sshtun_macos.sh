@@ -650,6 +650,12 @@ doctor_vpn() {
   echo "== pf =="
   pfctl -s info 2>/dev/null | sed -n '1,3p' || echo "pfctl недоступен"
   pfctl -a "$PF_ANCHOR_NAME" -s rules 2>/dev/null || echo "(anchor пуст/не загружен)"
+  echo "-- table sshtun_bypass --"
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_bypass -T show 2>/dev/null || echo "(таблица недоступна)"
+  echo "-- rules+counters (Inbound/Outbound per rule) --"
+  pfctl -a "$PF_ANCHOR_NAME" -vvsr 2>/dev/null | grep -E '^@|packets' | sed -n '1,40p' || true
+  echo "-- states ( ESTABLISHED: flows висящие на правилах anchor'а ) --"
+  pfctl -a "$PF_ANCHOR_NAME" -vvs state 2>/dev/null | grep -E '_[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | sed -n '1,20p' || echo "(state недоступны)"
   echo
   echo "== utun devices =="
   for d in $(utun_list); do
