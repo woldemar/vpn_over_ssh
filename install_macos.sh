@@ -224,6 +224,13 @@ write_plist() {
     <!-- brew bash (>=4.3) раньше системного 3.2; Tailscale и пр. не ломаем -->
     <key>PATH</key>
     <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <!-- Служба идёт ОТ ROOT: HOME не задан (set -u падает) и указывал бы
+    в /var/root. Пути к данным/ключу пользователя задаём явно (паритет с
+    Environment= в systemd-юните Linux-клиента). -->
+    <key>EXCLUDES_DIR</key>
+    <string>$INSTALL_USER_HOME/sshtun</string>
+    <key>KEY_FILE</key>
+    <string>$INSTALL_USER_HOME/.ssh/sshtun_ed25519</string>
   </dict>
   <key>RunAtLoad</key>
   <false/>
@@ -237,7 +244,7 @@ write_plist() {
 </plist>
 EOF
   chmod 0644 "$PLIST_PATH"
-  log "LaunchDaemon plist: $PLIST_PATH (выключен: RunAtLoad=false; включение — в HOWTO-macos §5)"
+  log "LaunchDaemon plist: $PLIST_PATH (выключен: RunAtLoad=false; включение: sudo $INSTALL_DIR/sshtun-root service-start)"
 }
 
 service_enable() {
@@ -275,8 +282,8 @@ do_install() {
      (или вручную ~/sshtun/server.conf: SERVER_HOST=<host>)
 
 Служба (досмотр launchd, аналог systemd):
-  включить:  sudo launchctl bootstrap system $PLIST_PATH
-  выключить: sudo launchctl bootout system/$SERVICE_LABEL
+  включить:  sudo $INSTALL_DIR/sshtun-root service-start   # bootout+bootstrap, дальше KeepAlive
+  выключить: sudo $INSTALL_DIR/sshtun-root service-stop    # или: launchctl bootout system/$SERVICE_LABEL
   лог:       tail -f $LOG_FILE
 EOF
 }

@@ -10,6 +10,8 @@
 #                             Defaults env_keep в sudoers)
 #   state-var VAR...       -> чтение переменных из /var/run/sshtun/state
 #   service-stop           -> launchctl bootout/stop (досмотр службы)
+#   service-start          -> launchctl bootout+bootstrap (поднять/перечитать
+#                             службу; KeepAlive сам стартует туннель)
 #   service-restart        -> launchctl kickstart -k
 #
 # Файл принадлежит root и лежит в root-owned каталоге /opt/sshtun_client:
@@ -48,6 +50,14 @@ case "${1:-}" in
   service-stop)
     exec launchctl bootout "system/$SERVICE_LABEL" 2>/dev/null \
       || exec launchctl stop "$SERVICE_LABEL"
+    ;;
+  service-start)
+    # Загрузить (или перечитать после правки plist): bootout + bootstrap.
+    # KeepAlive в plist сам поднимет туннель сразу после bootstrap.
+    PLIST="/Library/LaunchDaemons/$SERVICE_LABEL.plist"
+    [[ -f "$PLIST" ]] || { echo "нет $PLIST — запустите install_macos.sh" >&2; exit 1; }
+    launchctl bootout "system/$SERVICE_LABEL" 2>/dev/null || true
+    exec launchctl bootstrap "system" "$PLIST"
     ;;
   service-restart)
     exec launchctl kickstart -k "system/$SERVICE_LABEL"
