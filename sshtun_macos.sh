@@ -718,6 +718,24 @@ case "$cmd" in
   stop)  stop_vpn ;;
   status) status_vpn ;;
   doctor) doctor_vpn ;;
+  pfprobe)
+    # Диагностика pf/маршрутов живого туннеля (keepalive-расследование).
+    need_root
+    local sip=""
+    [[ -f "$STATE_FILE" ]] && { sip="$(awk -F= '/^SERVER_REAL_IP=/{gsub(/["'"'"']/,"",$2); print $2}' "$STATE_FILE" | tail -1)"; }
+    echo "== route to server (${sip:-unknown}) =="
+    [[ -n "$sip" ]] && route -n get "$sip" 2>/dev/null | grep -E 'route to|gateway|interface' || echo "(state пуст — туннель не поднимался)"
+    echo "== route to 1.1.1.1 (catch-all halves?) =="
+    route -n get 1.1.1.1 2>/dev/null | grep -E 'route to|gateway|interface'
+    echo "== ip forwarding =="
+    sysctl net.inet.ip.forwarding 2>/dev/null
+    echo "== pf states (anchor) =="
+    pfctl -a "$PF_ANCHOR_NAME" -s state 2>/dev/null | sed -n '1,15p' || echo "(anchor пуст)"
+    echo "== pf rule counters =="
+    pfctl -a "$PF_ANCHOR_NAME" -vvsr 2>/dev/null | grep -E '^@|Packets' | sed -n '1,50p'
+    echo "== pf main ruleset =="
+    pfctl -s rules 2>/dev/null | sed -n '1,15p'
+    ;;
   cleanup) cleanup_vpn ;;
   apply-diff) apply_diff ;;
   -h|--help|help|"") usage ;;
