@@ -138,8 +138,11 @@ sudo TCP_CONGESTION_CONTROL=cubic bash install_client.sh install  # откат �
 (существующие файлы не трогает). Также ставит systemd-юнит
 `/etc/systemd/system/sshtun.service` **выключенным** — досмотр туннеля с
 перезапуском при любом падении (сон, пропадание сети, внешний kill) и
-опциональный автостарт при загрузке. Ручной `sshtun down`/`restart` при
-работающей службе автоматически идут через `systemctl stop/restart`:
+опциональный автостарт при загрузке. Когда юнит установлен, обычный
+`sshtun up` поднимает туннель **через службу** (это дефолт); прямой фоновый
+запуск без досмотра остаётся только явным флагом: `sshtun up --background`.
+Ручной `sshtun down`/`restart` при работающей службе автоматически идут
+через `systemctl stop/restart`:
 
 ```bash
 systemctl start sshtun     # туннель под досмотром systemd
