@@ -203,16 +203,17 @@ pf_write_anchor() { # правила с подставленным utun/peer
     printf 'table <sshtun_excludes> persist file "%s"\n' "$TBL_EXCLUDES"
     printf 'table <sshtun_includes> persist file "%s"\n' "$TBL_INCLUDES"
     printf 'table <sshtun_bypass> persist file "%s"\n' "$TBL_BYPASS"
-    # порядок = семантика: include (равный префикс побеждает), exclude (LPM),
-    # bypass (сервер/шлюз/link-local), multicast, IPv6-block, catch-all.
-    # Catch-all — БЕЗ route-to: иначе pf форвардит пакет с исходным src
-    # (192.168.x.x), а ответы теряются (наблюдено: 590 пакетов в туннель,
-    # 4 обратно). Вместо этого catch-all просто пропускаем, а в туннель
-    # трафик заворачивают ДВА ПОЛУ-DEFAULT'а в таблице маршрутизации
-    # (0.0.0.0/1 + 128.0.0.0/1 via peer — добавляет бэкенд): тогда src
-    # выбирает ядро адресом utun — как на Linux. ВАЖНО: при этом /1'ы
-    # захватывают и сам ssh-поток к серверу — ему бэкенд отдельно ставит
-    # хост-маршрут /32 через дефолтный шлюз (add_server_bypass_route).
+    # порядок = семантика: include ВСЕГДА побеждает exclude (pf не делает
+    # LPM между таблицами — первое quick-правило; на Linux более длинный
+    # exclude-префикс выиграл бы), exclude, bypass (сервер/шлюз/link-local),
+    # multicast, IPv6-block, catch-all.
+    # ИСКЛЮЧЕНИЯ — НЕ pf, а МАРШРУТЫ (apply_exclude_routes): из-за /1-халв
+    # сокеты выбирают src = адрес utun, и ни route-to, ни binat ответы
+    # сокетам не вернут (state binat прибит интерфейсом utun, а ответы
+    # приходят на en0). Реальные маршруты через шлюз чинят src-selection
+    # в корне: сокет сразу биндится физическим адресом, ответы возвращаются
+    # естественно — как на Linux. Правило ниже — plain pass: матчит пакеты
+    # до catch-all (счётчики pfctl -vvsr) и документирует набор.
     printf 'pass out quick route-to (%s %s) inet from any to <sshtun_includes>\n' "$TUN_DEV" "$SERVER_TUN_IP"
     printf 'pass out quick inet from any to <sshtun_excludes>\n'
     printf 'pass out quick inet from any to <sshtun_bypass>\n'
@@ -260,6 +261,14 @@ pf_load_anchor() {
     || die "pfctl не загрузил anchor: $pf_err
 anchors в ruleset: $(pfctl -s anchors 2>/dev/null | tr '\n' ' ')
 anchor-строка в pf.conf: $(grep -n 'anchor "com.sshtun"' /etc/pf.conf 2>/dev/null || echo 'ОТСУТСТВУЕТ')"
+  # КЛЮЧЕВОЕ: «persist file» читает файл ТОЛЬКО при создании таблицы.
+  # После stop (pfctl -F all опустошает таблицы) повторный «pfctl -f»
+  # правила перечитывает, а таблицы оставляет ПУСТЫМИ — исключения
+  # молча перестают работать. Поэтому наполняем их явно при каждой
+  # загрузке anchor.
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_excludes -T replace -f "$TBL_EXCLUDES" 2>/dev/null || true
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_includes -T replace -f "$TBL_INCLUDES" 2>/dev/null || true
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_bypass   -T replace -f "$TBL_BYPASS"   2>/dev/null || true
 }
 
 pf_flush_anchor() {
@@ -300,6 +309,39 @@ del_server_bypass_route() {
   route -q delete -host "$SERVER_REAL_IP" "$DEFAULT_GW" >/dev/null 2>&1 || true
 }
 
+# Исключения реализованы МАРШРУТАМИ, а не pf: из-за /1-халв сокеты выбирают
+# src = адрес utun, и pf-уровень (route-to/binat) не способен вернуть ответы
+# таким сокетам (state binat прибит интерфейсом utun, ответы идут на en0).
+# Реальные маршруты через шлюз чинят src-selection в корне. Порядок ~3 мс на
+# префикс (~40 с на 12,5k) — поэтому ставим/снимаем в ФОНЕ, ход в лог.
+apply_exclude_routes() { # op(add|delete) cidr-file [gw]
+  local op="$1" f="$2" gw="${3:-}"
+  [[ -s "$f" ]] || return 0
+  [[ -n "$gw" ]] || gw="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2; exit}')"
+  [[ -n "$gw" ]] || { log "WARNING: шлюз не определён — exclude-маршруты ($op) пропущены"; return 0; }
+  python3 - "$op" "$gw" "$f" >>"$STATE_DIR/routes.log" 2>&1 <<'PY' || log "WARNING: exclude-маршруты ($op) применены частично (routes.log)"
+import sys, ipaddress, subprocess
+op, gw, path = sys.argv[1], sys.argv[2], sys.argv[3]
+ok = bad = 0
+with open(path) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            net = ipaddress.ip_network(line, strict=False)
+        except ValueError:
+            bad += 1
+            continue
+        if net.version != 4:
+            continue
+        subprocess.run(["route", "-q", op, "-net", str(net.network_address),
+                        "-netmask", str(net.netmask), gw], capture_output=True)
+        ok += 1
+print(f"exclude-routes {op}: {ok} ok, {bad} bad", file=sys.stderr)
+PY
+}
+
 # Живое применение diff'ов от обёртки: пересобираем таблицы из файлов
 # политики (обёртка уже перезаписала exclude/include-файлы) и перегружаем
 # anchor. Перечитываем списки из state (пути файлов политики).
@@ -315,10 +357,25 @@ apply_diff() {
   for f in ${ROUTE_FILES_SAVED:-}; do ROUTE_FILES+=("$f"); done
   [[ -n "${TUN_DEV:-}" && -n "${SERVER_TUN_IP:-}" ]] || die "state неполон (TUN_DEV/SERVER_TUN_IP)"
   mkdir -p "$PF_RUNTIME_DIR"
+  # дельта exclude-маршрутов: сохраняем прошлый набор ДО перезаписи таблиц
+  local prev="$PF_RUNTIME_DIR/excludes.prev"
+  [[ -f "$TBL_EXCLUDES" ]] && cp "$TBL_EXCLUDES" "$prev" || : > "$prev"
   pf_write_tables
   pf_write_anchor
   pfctl -a "$PF_ANCHOR_NAME" -f "$ANCHOR_CONF" >/dev/null \
     || die "pfctl reload anchor не удался"
+  # см. pf_load_anchor: «persist file» не перечитывает файл при reload —
+  # наполняем таблицы явно.
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_excludes -T replace -f "$TBL_EXCLUDES" 2>/dev/null || true
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_includes -T replace -f "$TBL_INCLUDES" 2>/dev/null || true
+  pfctl -a "$PF_ANCHOR_NAME" -t sshtun_bypass   -T replace -f "$TBL_BYPASS"   2>/dev/null || true
+  # маршруты: только разница против прошлого набора (дешёво даже на 12,5k)
+  local add_f="$PF_RUNTIME_DIR/excludes.add" del_f="$PF_RUNTIME_DIR/excludes.del"
+  comm -13 <(sort -u "$prev") <(sort -u "$TBL_EXCLUDES") > "$add_f"
+  comm -23 <(sort -u "$prev") <(sort -u "$TBL_EXCLUDES") > "$del_f"
+  apply_exclude_routes add "$add_f"
+  apply_exclude_routes delete "$del_f"
+  rm -f "$add_f" "$del_f"
   log "pf-таблицы пересобраны: excludes=$(grep -c . "$TBL_EXCLUDES" || true) includes=$(grep -c . "$TBL_INCLUDES" || true)"
 }
 
@@ -573,7 +630,11 @@ start_vpn() {
   pf_load_anchor
   add_tunnel_routes
   add_server_bypass_route
-  log "pf anchor $PF_ANCHOR_NAME загружен ($TUN_DEV -> $SERVER_TUN_IP)"
+  # exclude-маршруты (12,5k) — в фоне: src-selection станет корректным
+  # по мере установки; до конца установки exclude-трафик временно пойдёт
+  # в туннель (не ломает соединение, только лишний хоп).
+  apply_exclude_routes add "$TBL_EXCLUDES" "$DEFAULT_GW" &
+  log "pf anchor $PF_ANCHOR_NAME загружен ($TUN_DEV -> $SERVER_TUN_IP); exclude-маршруты ставятся в фоне"
 
   # state пишем ДО dns_save_and_set: та ДОПИСЫВАЕТ DNS_* в конец файла,
   # а write_state перезаписывает файл с нуля — иначе бэкап DNS теряется.
@@ -612,6 +673,10 @@ stop_cleanup() {
     dns_restore || true
     del_server_bypass_route || true
     del_tunnel_routes || true
+    # exclude-маршруты снимаем в фоне (12,5k × ~3 мс — не блокируем stop;
+    # висящие после stop маршруты ведут себя как «direct», что корректно
+    # для остановленного туннеля; дельты применяются в apply_diff).
+    apply_exclude_routes delete "$TBL_EXCLUDES" &
   fi
 
   # ssh
@@ -666,7 +731,12 @@ status_vpn() {
     echo "SUPERVISED: ${SUPERVISED:-0}"
     echo "Policy: pf anchor $PF_ANCHOR_NAME (route-to ${TUN_DEV:-?})"
     if [[ -f "$TBL_EXCLUDES" ]]; then
-      echo "Policy entries: excludes=$(grep -c . "$TBL_EXCLUDES" || true) includes=$(grep -c . "$TBL_INCLUDES" 2>/dev/null || true)"
+      # файл таблицы и РЕАЛЬНОЕ содержимое pf-таблицы рядом: «persist file»
+      # не перечитывает файл при reload — рассинхрон виден сразу.
+      local pf_exc="" pf_inc=""
+      pf_exc="$(pfctl -a "$PF_ANCHOR_NAME" -t sshtun_excludes -T show 2>/dev/null | grep -c / || true)"
+      pf_inc="$(pfctl -a "$PF_ANCHOR_NAME" -t sshtun_includes -T show 2>/dev/null | grep -c / || true)"
+      echo "Policy entries: excludes=$(grep -c . "$TBL_EXCLUDES" || true) includes=$(grep -c . "$TBL_INCLUDES" 2>/dev/null || true) (pf-live: ${pf_exc:-?}/${pf_inc:-?})"
     fi
     ifconfig "${TUN_DEV:-}" 2>/dev/null | sed -n '1,4p' || true
   else
@@ -786,9 +856,13 @@ case "$cmd" in
     echo "== pf states (anchor) =="
     pfctl -a "$PF_ANCHOR_NAME" -s state 2>/dev/null | sed -n '1,15p' || echo "(anchor пуст)"
     echo "== pf rule counters =="
-    pfctl -a "$PF_ANCHOR_NAME" -vvsr 2>/dev/null | grep -E '^@|Packets' | sed -n '1,50p'
+    pfctl -a "$PF_ANCHOR_NAME" -vvsr 2>/dev/null | grep -E '^@|Packets' | sed -n '1,50p' || true
+    echo "== pf nat/binat (anchor) =="
+    pfctl -a "$PF_ANCHOR_NAME" -s nat 2>/dev/null || echo "(нет translation-правил)"
     echo "== pf main ruleset =="
     pfctl -s rules 2>/dev/null | sed -n '1,15p'
+    echo "== anchor.conf (generated) =="
+    cat "$ANCHOR_CONF" 2>/dev/null || echo "(нет $ANCHOR_CONF)"
     ;;
   cleanup) cleanup_vpn ;;
   apply-diff) apply_diff ;;
