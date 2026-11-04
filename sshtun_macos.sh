@@ -757,6 +757,15 @@ case "$cmd" in
     ;;
   cleanup) cleanup_vpn ;;
   apply-diff) apply_diff ;;
+  sniff)
+    # ВРЕМЕННАЯ диагностика (data-path): tcpdump на utun за root.
+    # Фильтр — только как trailing-аргументы BPF; интерфейс — из state.
+    need_root
+    dev=""
+    [[ -f "$STATE_FILE" ]] && dev="$(awk -F= '/^TUN_DEV=/{gsub(/"/,"",$2); print $2}' "$STATE_FILE" 2>/dev/null | tail -1)"
+    dev="${dev:-utun4}"
+    exec /usr/sbin/tcpdump -i "$dev" -nn -s0 -c "${SNIFF_COUNT:-300}" "$@"
+    ;;
   -h|--help|help|"") usage ;;
   *) die "Неизвестная команда: $cmd (см. $0 --help)" ;;
 esac
