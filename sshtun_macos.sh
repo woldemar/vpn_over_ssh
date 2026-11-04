@@ -721,7 +721,7 @@ case "$cmd" in
   pfprobe)
     # Диагностика pf/маршрутов живого туннеля (keepalive-расследование).
     need_root
-    local sip=""
+    sip=""
     [[ -f "$STATE_FILE" ]] && { sip="$(awk -F= '/^SERVER_REAL_IP=/{gsub(/["'"'"']/,"",$2); print $2}' "$STATE_FILE" | tail -1)"; }
     echo "== route to server (${sip:-unknown}) =="
     [[ -n "$sip" ]] && route -n get "$sip" 2>/dev/null | grep -E 'route to|gateway|interface' || echo "(state пуст — туннель не поднимался)"
