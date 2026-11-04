@@ -434,10 +434,22 @@ write_state() {
 start_vpn() {
   need_root
   acquire_lock
-  trap 'release_lock' EXIT
+  START_OK="0"
+  # При неудачном старте маркер «starting» из state надо снять — иначе
+  # status будет вечно показывать «starting». Успех: START_OK=1 (ниже).
+  trap 'rc=$?; if [[ "$START_OK" != "1" && $rc -ne 0 ]]; then rm -f "$STATE_FILE" 2>/dev/null || true; fi; release_lock' EXIT
 
   [[ -n "$HOST" ]] || die "--host не задан"
   [[ -f "$KEY_FILE" ]] || die "ключ не найден: $KEY_FILE"
+
+  # Ранний маркер «стартую»: пока идёт подключение, status показывает
+  # понятное «starting» вместо загадочного «stopped». Успех — write_state
+  # перезапишет маркер полным state; неудача — stop_cleanup сотрёт файл.
+  mkdir -p "$STATE_DIR"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
+  printf 'PHASE=starting\nSTARTED_AT=%s\nHOST=%s\nSSH_USER=%s\nSSH_PORT=%s\nSSH_PID=\n' \
+    "$(date +%s)" "$HOST" "$SSH_USER" "$SSH_PORT" > "$STATE_FILE"
+
   log "SSH: $SSH_BIN ($("$SSH_BIN" -V 2>&1 | head -n1 || true))"
 
   detect_default_route
@@ -651,7 +663,13 @@ status_vpn() {
     fi
     ifconfig "${TUN_DEV:-}" 2>/dev/null | sed -n '1,4p' || true
   else
-    echo "Status: stopped"
+    if [[ "${PHASE:-}" == "starting" && "${STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+      local age=$(( $(date +%s) - STARTED_AT ))
+      echo "Status: starting (подключение к ${SSH_USER:-?}@${HOST:-?}:${SSH_PORT:-?}, идёт ${age} с)"
+      echo "Норма ~10-15 с; если зависло — sshtun down и повторите. Лог: /var/log/sshtun.log"
+    else
+      echo "Status: stopped"
+    fi
   fi
   # остатки utun с адресами из наших сетей (активный не считаем leftover)
   local leftovers="" active_dev=""

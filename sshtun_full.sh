@@ -939,6 +939,37 @@ autogen_fresh() {
   (( newest > 0 && $(date +%s) - newest < AUTOGEN_TTL_SEC ))
 }
 
+# Человекочитаемый возраст: N сек / N мин / N ч / N дн.
+fmt_age() { # seconds
+  local s="$1"
+  (( s < 90 )) && { printf '%d сек' "$s"; return; }
+  (( s < 5400 )) && { printf '%d мин' $((s / 60)); return; }
+  (( s < 129600 )) && { printf '%d ч' $((s / 3600)); return; }
+  printf '%d дн' $((s / 86400))
+}
+
+# Строка для 'sshtun status': насколько свежи автогенные списки и как их
+# принудительно обновить (раньше обновление при старте было видно в логе,
+# теперь оно TTL-gated и «невидимо» — статус должен объяснять состояние).
+autogen_status() {
+  local newest=0 f m
+  for f in "$AS_GENERATED" "$COUNTRY_GENERATED"; do
+    [[ -f "$f" ]] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+    [[ "$m" =~ ^[0-9]+$ ]] && (( m > newest )) && newest=$m
+  done
+  if (( newest == 0 )); then
+    echo "Списки AS/стран: кэша нет — при первом старте скачаются (принудительно: sshtun refresh)"
+    return
+  fi
+  local age=$(( $(date +%s) - newest ))
+  if (( age < AUTOGEN_TTL_SEC )); then
+    echo "Списки AS/стран: свежи ($(fmt_age "$age") назад; автообновление раз в $((AUTOGEN_TTL_SEC / 3600)) ч, принудительно: sshtun refresh)"
+  else
+    echo "Списки AS/стран: УСТАРЕЛИ ($(fmt_age "$age") назад; обновите: sshtun refresh)"
+  fi
+}
+
 ensure_autogen() {
   local need=0
   local srcs=""
@@ -1654,7 +1685,7 @@ case "$cmd" in
   up|start)        shift; start_vpn "$@" ;;
   down|stop)       shift; stop_vpn "$@" ;;
   restart)         shift; restart_vpn "$@" ;;
-  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; client_cmd status "$@" ;;
+  status)          shift; check_client; printf 'Профиль: %s\n' "$(profile_display)"; autogen_status; client_cmd status "$@" ;;
   doctor)          shift; check_client; client_cmd doctor "$@" ;;
   cleanup)         shift; check_client; client_cmd cleanup "$@" ;;
   exclude)

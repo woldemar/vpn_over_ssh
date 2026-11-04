@@ -712,8 +712,14 @@ status_vpn() {
       echo "Policy routes: direct=$(ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | wc -l) tun=$(ip -4 route show table "$POLICY_TABLE_TUN" 2>/dev/null | wc -l)"
       ip addr show "$TUN_DEV" 2>/dev/null | sed -n '1,8p' || true
     else
-      echo "Status: stale state, SSH process is not running"
-      echo "Run: sudo $0 stop"
+      if [[ "${PHASE:-}" == "starting" && "${STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+        local age=$(( $(date +%s) - STARTED_AT ))
+        echo "Status: starting (подключение к ${SSH_USER:-?}@${HOST:-?}:${SSH_PORT:-?}, идёт ${age} с)"
+        echo "Норма ~10-15 с; если зависло — sudo $0 stop и повторите. Лог: $SSH_LAST_LOG"
+      else
+        echo "Status: stale state, SSH process is not running"
+        echo "Run: sudo $0 stop"
+      fi
     fi
   fi
 
@@ -1102,6 +1108,13 @@ start_vpn() {
 
   mkdir -p "$STATE_DIR"
   chmod 700 "$STATE_DIR"
+
+  # Ранний маркер «стартую»: пока идёт подключение (resolve, ssh handshake,
+  # маршруты), status показывает понятное «starting» вместо загадочного
+  # «stopped». Успех — write_state перезапишет маркер полным state;
+  # неудача — cleanup_partial_start сотрёт файл.
+  printf 'PHASE=starting\nSTARTED_AT=%q\nHOST=%q\nSSH_USER=%q\nSSH_PORT=%q\nSSH_PID=\n' \
+    "$(date +%s)" "$HOST" "$SSH_USER" "$SSH_PORT" > "$STATE_FILE"
 
   if command -v modprobe >/dev/null 2>&1; then
     modprobe tun 2>/dev/null || true
