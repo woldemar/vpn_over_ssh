@@ -223,10 +223,25 @@ Windows-клиент на Go. Использует Wintun и совместим�
 - состояние в `C:\ProgramData\sshtun_pool_client\state.json`;
 - runtime-лог в `C:\ProgramData\sshtun_pool_client\sshtun.log`;
 - full-tunnel и split-tunnel;
-- include/exclude CIDR и route-файлы;
+- include/exclude CIDR и route-файлы (флагами при старте);
 - encrypted private keys;
 - `status`, `doctor`, `cleanup`;
 - pinning SSH host key через `--host-key-sha256`.
+
+### Статус поддержки (важно)
+
+Windows-клиент — самостоятельный Go-бинарь со своим CLI; обёртки `sshtun`
+(как на Linux/macOS) для него нет. Покрывает базовый сценарий: full/
+split-tunnel, списки route/include/exclude **только флагами при старте**
+(живое `exclude add/del` без перезапуска — только на Linux/macOS), DNS,
+keepalive, `status`/`doctor`/`cleanup`. **Не поддерживает:** автогенерацию
+по AS/странам (`fetch-as` / `fetch-country` / `refresh` и файлы-токены),
+профили серверов (`server add/use/rename`), службы досмотра с
+автопереподъёмом (systemd/launchd) — на Windows рестарт только вручную.
+
+Windows-версия сейчас **не развивается и не тестируется**. Протокол
+(`tun@openssh.com`) с актуальным сервером совместим, но свежий функционал
+в первую очередь (и зачастую — только) появляется на Linux/macOS.
 
 ## Требования
 

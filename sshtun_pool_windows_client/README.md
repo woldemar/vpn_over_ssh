@@ -11,7 +11,7 @@ The server is already prepared with a dedicated SSH-TUN service:
 - user: `sshvpn`
 - port: `65523`
 - `PermitTunnel point-to-point`
-- prepared tun pool, for example `tun100..tun200`
+- prepared tun pool, for example `tun200..tun250`
 - NAT/forwarding enabled for `10.250.0.0/16`
 
 This Windows client expects the server-side tun pool to already exist.
@@ -52,8 +52,8 @@ With explicit Linux-compatible options:
   --user sshvpn `
   --port 65523 `
   --key .\id_ed25519 `
-  --tun-start 100 `
-  --tun-end 200 `
+  --tun-start 200 `
+  --tun-end 250 `
   --mtu 1400
 ```
 
