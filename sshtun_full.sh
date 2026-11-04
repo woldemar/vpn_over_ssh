@@ -1010,7 +1010,9 @@ start_vpn() {
   # Дефолт — ЧЕРЕЗ СЛУЖБУ. Иначе фоновый запуск без досмотра оставляет
   # «stale state» после сна/обрыва (некому перезапустить ssh). Фон без
   # досмотра — только явный 'up --background'.
-  if (( ! background && ! foreground )); then
+  # На macOS служба — launchd (своя логика supervisor_*), systemd нет:
+  # блок целиком только для Linux.
+  if [[ "$UNAME_S" != "Darwin" ]] && (( ! background && ! foreground )); then
     if systemd_unit_available; then
       if env_overrides_present; then
         log "Параметры заданы через env — в systemd-юнит они не попадут;"
