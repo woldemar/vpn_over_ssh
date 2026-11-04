@@ -921,6 +921,24 @@ migrate_legacy_inline() { # src_token_file dst_generated
 # — старые файлы с инлайн-префиксами так перекачиваются при первом же 'up'.
 # Токены есть: refresh (при неудаче — fallback на кэш, иначе legacy-миграция,
 # иначе die). Источников нет: подхватим legacy-инлайн, если файл старого формата.
+#
+# Автообновление при 'up' — не чаще раза в AUTOGEN_TTL_SEC: каждый рестарт
+# службы иначе блокируется на последовательных сетевых загрузках (RIPEstat/
+# ipdeny, до --max-time на каждую), а для дневных зон это свежесть не добавляет.
+# 'sshtun refresh' обновляет принудительно (SSHTUN_FORCE_REFRESH=1 — тоже).
+AUTOGEN_TTL_SEC="${AUTOGEN_TTL_SEC:-43200}"
+
+autogen_fresh() {
+  local newest=0 f m
+  for f in "$AS_GENERATED" "$COUNTRY_GENERATED"; do
+    [[ -f "$f" ]] || continue
+    m="$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)"
+    [[ "$m" =~ ^[0-9]+$ ]] || continue
+    (( m > newest )) && newest=$m
+  done
+  (( newest > 0 && $(date +%s) - newest < AUTOGEN_TTL_SEC ))
+}
+
 ensure_autogen() {
   local need=0
   local srcs=""
@@ -931,6 +949,10 @@ ensure_autogen() {
   if (( need == 0 )); then
     migrate_legacy_inline "$AS_EXCLUDES" "$AS_GENERATED"
     migrate_legacy_inline "$COUNTRY_EXCLUDES" "$COUNTRY_GENERATED"
+    return 0
+  fi
+  if [[ "${SSHTUN_FORCE_REFRESH:-0}" != "1" ]] && autogen_fresh; then
+    log "Автогенные списки свежи (младше $((AUTOGEN_TTL_SEC / 3600)) ч) — сетевое обновление пропущено; принудительно: sshtun refresh"
     return 0
   fi
   if refresh_lists; then
