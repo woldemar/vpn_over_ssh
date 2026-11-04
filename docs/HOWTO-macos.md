@@ -1,9 +1,33 @@
-# HOWTO (macOS, Intel): установка и тестирование клиента sshtun
+# HOWTO (macOS): установка и тестирование клиента sshtun
 
-Порт клиента vpn_over_ssh на macOS. Полный функционал Linux-версии:
-full-tunnel через SSH (ssh -w / utun), исключения (exclude), принудительные
-маршруты (include), автогенерация по AS/странам, профили серверов
-(`server add/use/rename`), служба автозапуска/досмотра (launchd).
+Порт клиента vpn_over_ssh на macOS (Intel и Apple Silicon — M1..M5).
+Полный функционал Linux-версии: full-tunnel через SSH, исключения
+(exclude), принудительные маршруты (include), автогенерация по AS/странам,
+профили серверов (`server add/use/rename`), служба автозапуска/досмотра
+(launchd).
+
+## Быстрый старт (минимальный путь)
+
+```bash
+# 1. Инструменты сборки (один раз; bash 5.2 + ssh -> ~/sshtun-tools):
+xcode-select --install
+bash prepare_macos.sh
+
+# 2. Установка (копирует скрипты, plist службы, sudoers-правило):
+sudo bash install_macos.sh install
+
+# 3. Ключ и сервер:
+ssh-keygen -t ed25519 -f ~/.ssh/sshtun_ed25519 -N "" -C "$(whoami)-$(hostname)"
+cat ~/.ssh/sshtun_ed25519.pub   # добавить на сервер в /opt/sshtun_pool/authorized_keys
+sshtun server add fin <адрес-сервера> -- "основной"
+
+# 4. Подъём и автодосмотр (туннель сам переживает сон ноутбука):
+sshtun up
+sudo /opt/sshtun_client/sshtun-root service-start   # служба launchd (KeepAlive)
+curl -4 ifconfig.me                                  # должен показать IP сервера
+```
+
+Дальше — подробности по каждому шагу и тесты.
 
 ## Как это устроено (отличия от Linux)
 
@@ -34,18 +58,24 @@ full-tunnel через SSH (ssh -w / utun), исключения (exclude), пр
 
 ## 0. Требования
 
-- macOS Sonoma/Sequoia (Intel).
+- macOS Sonoma/Sequoia. **Intel и Apple Silicon (M1..M5)** — различий в
+  установке нет: установщик сам выбирает data-plane-бинарь под архитектуру
+  (`uname -m`), в репозитории лежат обе кросс-сборки
+  (`sshtun-macos-tun.amd64` / `.arm64`).
 - **bash >= 4.3** — системный bash 3.2 не подходит (nameref/assoc-arrays).
   Без brew, без root (нужен Xcode CLT):
   ```bash
   bash prepare_macos.sh   # bash + LibreSSL + OpenSSH -> ~/sshtun-tools
   ```
-  (если brew установлен, подойдёт `brew install bash openssh`.)
+  (если brew установлен, подойдёт `brew install bash openssh` — установщик
+  ищет и в /usr/local/bin, и в /opt/homebrew/bin.)
 - `xcode-select --install` (python3/dig — из CLT).
-- Data-plane-бинарь `sshtun-macos-tun` идёт в репозитории (кросс-сборка
-  `CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build`); installer кладёт его
-  в /opt/sshtun_client. Свежая сборка по LAN: scp в `~/sshtun-tools/bin/`
-  (бэкенд ищет сначала там — обновление без root).
+- Data-plane-бинарь идёт в репозитории для обеих архитектур. Своя сборка
+  (нужен Go): `cd sshtun_macos_client && CGO_ENABLED=0 GOOS=darwin
+  GOARCH=amd64 go build -o sshtun-macos-tun.amd64 .` (для M-серии —
+  `GOARCH=arm64`, выход `sshtun-macos-tun.arm64`). Свежая сборка по LAN
+  обновляется без root: scp в `~/sshtun-tools/bin/` (бэкенд ищет сначала
+  там).
 - Установщик сам найдёт подходящие bash/ssh и запишет пути в
   `/opt/sshtun_client/env.conf`; шим `/usr/local/bin/sshtun` жёстко
   привязан к нужному bash.

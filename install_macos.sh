@@ -97,12 +97,22 @@ install_files() {
   install -m 0755 -o root -g wheel "$REPO_DIR/sshtun_root.sh" "$INSTALL_DIR/sshtun-root"
   log "Root-хелпер: $INSTALL_DIR/sshtun-root (root:wheel 0755)"
   # Go data-plane (tun@openssh.com в userspace — замена «ssh -w» на macOS).
-  # Бинарь кросс-собирается: cd sshtun_macos_client && GOOS=darwin GOARCH=amd64 go build
-  if [[ -f "$REPO_DIR/sshtun_macos_client/sshtun-macos-tun" ]]; then
+  # В репо обе архитектуры (кросс-сборка): installer выбирает под uname -m.
+  # Пересборка: cd sshtun_macos_client && GOOS=darwin GOARCH=amd64|arm64 go build
+  local _dp_bin=""
+  case "$(uname -m 2>/dev/null || echo x86_64)" in
+    arm64|aarch64) _dp_bin="sshtun-macos-tun.arm64" ;;
+    *) _dp_bin="sshtun-macos-tun.amd64" ;;
+  esac
+  if [[ -f "$REPO_DIR/sshtun_macos_client/$_dp_bin" ]]; then
+    install -m 0755 -o root -g wheel "$REPO_DIR/sshtun_macos_client/$_dp_bin" "$INSTALL_DIR/sshtun-macos-tun"
+    log "Data-plane: $INSTALL_DIR/sshtun-macos-tun ($_dp_bin)"
+  elif [[ -f "$REPO_DIR/sshtun_macos_client/sshtun-macos-tun" ]]; then
+    # legacy: единичная сборка без архитектурного суффикса
     install -m 0755 -o root -g wheel "$REPO_DIR/sshtun_macos_client/sshtun-macos-tun" "$INSTALL_DIR/sshtun-macos-tun"
-    log "Data-plane: $INSTALL_DIR/sshtun-macos-tun"
+    log "Data-plane: $INSTALL_DIR/sshtun-macos-tun (legacy, без суффикса архитектуры)"
   else
-    log "Data-plane: бинарь sshtun_macos_client/sshtun-macos-tun не найден — соберите (go build), без него up не заработает"
+    log "Data-plane: бинарь sshtun_macos_client/$_dp_bin не найден — соберите (go build), без него up не заработает"
   fi
   # env.conf: путь к ssh с -w (Apple ssh не умеет utun) и к bash >= 4.3
   # (иначе sudo/helper может запустить системный 3.2, который падает на
