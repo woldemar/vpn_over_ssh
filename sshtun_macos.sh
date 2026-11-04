@@ -470,9 +470,13 @@ start_vpn() {
       TUN_GO_BIN="$_uh/sshtun-tools/bin/sshtun-macos-tun"
     elif [[ -x "$SCRIPT_DIR_MACOS/sshtun-macos-tun" ]]; then
       TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun-macos-tun"
+    elif [[ -x "$SCRIPT_DIR_MACOS/sshtun_macos_client/sshtun-macos-tun" ]]; then
+      # бинарь живёт в подкаталоге репо (кросс-сборка Linux->darwin);
+      # для службы от root это путь свежее /opt-копии (обновляется git pull)
+      TUN_GO_BIN="$SCRIPT_DIR_MACOS/sshtun_macos_client/sshtun-macos-tun"
     elif [[ -x "/opt/sshtun_client/sshtun-macos-tun" ]]; then
       # служба launchd идёт ОТ ROOT (HOME=/var/root, user-local недостижим):
-      # installer кладёт бинарь сюда — единственный надёжный путь для службы.
+      # installer кладёт бинарь сюда — надёжный путь для службы без репо.
       TUN_GO_BIN="/opt/sshtun_client/sshtun-macos-tun"
     fi
   fi
