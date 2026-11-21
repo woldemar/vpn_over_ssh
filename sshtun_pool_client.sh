@@ -705,9 +705,16 @@ via_collect_want() {
         [[ -n "$line" ]] || continue
         case "$line" in *"proto kernel"*) continue ;; esac
         p="${line%% *}"
+        [[ "$p" =~ ^[0-9.]+$ ]] && p="$p/32"   # host-route без префикса
         case "$p" in 0.0.0.0/0|0.0.0.0/1|128.0.0.0/1) continue ;; esac
         [[ "$p" =~ ^[0-9.]+/[0-9]+$ ]] || continue
-        spec="$(via_canon_spec "$(parse_route_fields "$line")")"
+        fields="$(parse_route_fields "$line")"
+        fields="$p|${fields#*|}"   # канонический префикс (host-route -> /32)
+        # OpenVPN кладёт маршруты как "via G" БЕЗ dev (dev [NULL] в его логе) —
+        # подставляем интерфейс итерации, иначе replace в таблицу не встанет
+        # (шлюз вне контекста таблицы не резолвится).
+        [[ -z "${fields##*|}" ]] && fields="${fields%|*}|$f"
+        spec="$(via_canon_spec "$fields")"
         if [[ -z "${seen[$p]:-}" ]]; then seen[$p]=1; echo "$spec"; fi
       done <<<"$froutes"
     done < <(list_foreign_tuns)
