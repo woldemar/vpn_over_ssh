@@ -735,6 +735,7 @@ via_collect_cur() {
     { dev=""; gw=""; for(i=1;i<=NF;i++){ if($i=="via") gw=$(i+1); else if($i=="dev"){ dev=$(i+1); break } }
       if (dev !~ pat) next
       p=$1
+      if (index(p, "/") == 0) p = p "/32"   # ядро печатает host-маршруты без /32
       if (gw != "") printf "%s via %s dev %s\n", p, gw, dev
       else printf "%s dev %s\n", p, dev
     }'
