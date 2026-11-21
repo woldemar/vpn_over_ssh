@@ -14,6 +14,8 @@ IFS=$'\n\t'
 #   excludes-as.txt        — ИСТОЧНИКИ: токены AS (AS9009), по одному на строку
 #   excludes-country.txt   — ИСТОЧНИКИ: токены стран (ru, de, us)
 #   includes-force.txt     — принудительно В ТУННЕЛЬ (приоритет над excludes)
+#   routes-via.txt         — ручные via-маршруты ЧЕРЕЗ СТОРОННИЙ туннель
+#                            (openvpn tun0; Linux), строки "CIDR DEV [GW]"
 #   generated/             — АВТОГЕН: развёрнутые префиксы AS/стран (не править;
 #                            обновляются 'sshtun refresh' / автоматически при 'up')
 #   servers/<имя>.conf     — профили серверов (multihop-библиотека; активный
@@ -150,6 +152,7 @@ CUSTOM_EXCLUDES="$EXCLUDES_DIR/excludes-custom.txt"
 AS_EXCLUDES="$EXCLUDES_DIR/excludes-as.txt"
 COUNTRY_EXCLUDES="$EXCLUDES_DIR/excludes-country.txt"
 FORCE_INCLUDES="$EXCLUDES_DIR/includes-force.txt"
+VIA_ROUTES="$EXCLUDES_DIR/routes-via.txt"
 # Развёрнутые префиксы источников — отдельно от файлов-токенов: токены правят
 # руками/командами, префиксы скачиваются и лежат в generated/ (клиент читает их).
 GENERATED_DIR="${GENERATED_DIR:-$EXCLUDES_DIR/generated}"
@@ -205,6 +208,11 @@ usage() {
   $0 exclude del CIDR...    убрать из пользовательских исключений
   $0 include add CIDR... [-- комментарий]    принудительно в туннель (даже если в exclude)
   $0 include del CIDR...    убрать из include-списка
+  $0 via add CIDR ИНТЕРФЕЙС [-- коммент.]   через СТОРОННИЙ туннель (openvpn tun0) —
+                        позволяет работать sshtun и openvpn одновременно (Linux)
+  $0 via del CIDR [ИНТЕРФЕЙС]   убрать via-запись
+  $0 via list           показать via-список
+  $0 via sync           принудительно синхронизировать via-маршруты (туннель должен работать)
   $0 fetch-as AS... [--irr] [-- комментарий]   исключить префиксы AS (RIPEstat / bgpq4)
   $0 fetch-as --remove AS... убрать AS из автогенного списка
   $0 fetch-country CC... [-- комментарий]  исключить префиксы стран (ipdeny.com)
@@ -234,6 +242,10 @@ usage() {
 
 Принудительно в туннель (приоритет на равных префиксах):
   $FORCE_INCLUDES
+
+Совместимость с OpenVPN (Linux): маршруты чужих tun-интерфейсов
+(например openvpn tun0) зеркалируются в политическую таблицу автоматически
+(под досмотром службы) либо вручную — $VIA_ROUTES.
 
 Приоритет: более длинный префикс побеждает всегда (LPM);
 на равных префиксах force-файл побеждает exclude-файлы.
@@ -1097,6 +1109,7 @@ start_vpn() {
   [[ -f "$AS_GENERATED" ]] && args+=(--exclude-file "$AS_GENERATED")
   [[ -f "$COUNTRY_GENERATED" ]] && args+=(--exclude-file "$COUNTRY_GENERATED")
   [[ -f "$FORCE_INCLUDES" ]] && args+=(--route-file "$FORCE_INCLUDES")
+  [[ -f "$VIA_ROUTES" ]] && args+=(--via-file "$VIA_ROUTES")
   if (( foreground )); then
     # exec: процесс обёртки СТАНОВИТСЯ sudo -> клиент = main PID службы.
     # systemd при stop ждёт main: супервизор успевает дочистить маршруты,
@@ -1264,8 +1277,7 @@ force_add() {
 force_del() {
   local cidrs=() comment=""
   parse_cidrs_comment cidrs comment "$@"
-  ((${#cidrs[@]} >= 1)) || die "Укажите хотя бы одну сеть/адрес: $0 include del 203.0.113.0/24"
-  mkdir -p "$EXCLUDES_DIR"
+  ((${#cidrs[@]} >= 1)) || die "Укажите хотя бы одну сеть/адрес: $0 include del 203.0.113.0/24"  mkdir -p "$EXCLUDES_DIR"
   touch "$FORCE_INCLUDES"
 
   local cidr="" dels=() tmp=""
@@ -1282,6 +1294,96 @@ force_del() {
     fi
   done
   ((${#dels[@]})) && printf '%s\n' "${dels[@]}" | apply_force_changes
+}
+
+# ---------------------------------------------------------------------
+# Via-маршруты (Linux): сети, идущие через СТОРОННИЙ туннель (OpenVPN tun0),
+# а не напрямую и не в sshtun-туннель. Клиент зеркалирует их в политическую
+# таблицу (LPM: /16-/24 OpenVPN побеждает RFC1918-исключения /8-/12).
+# Источники: автодетект (вкл по умолчанию) + ручной файл routes-via.txt.
+
+via_linux_only() {
+  if [[ "$UNAME_S" == "Darwin" ]]; then
+    die "via-маршруты пока поддерживаются только на Linux (macOS — в следующих релизах)"
+  fi
+  return 0
+}
+
+via_file_ensure() {
+  mkdir -p "$EXCLUDES_DIR"
+  if [[ ! -f "$VIA_ROUTES" ]]; then
+    cat > "$VIA_ROUTES" <<'EOFVIA'
+# SSHTUN: via-маршруты — сети, идущие ЧЕРЕЗ СТОРОННИЙ туннель (OpenVPN tun0
+# и т.п.), а не напрямую и не в sshtun-туннель. Позволяет работать sshtun
+# и OpenVPN одновременно.
+# Формат строки: CIDR ИНТЕРФЕЙС [ШЛЮЗ]
+#   10.240.1.0/24 tun0
+# Комментарии (#) и пустые строки игнорируются.
+#
+# Автодетект: маршруты чужих tun-интерфейсов подхватываются автоматически
+# (каждые 10 с под досмотром службы; принудительно: sshtun via sync).
+# Этот файл — для статичных записей и как fallback, когда автодетект недоступен.
+EOFVIA
+    restore_owner "$VIA_ROUTES"
+    log "Создан файл: $VIA_ROUTES"
+  fi
+}
+
+via_sync_live() {
+  if ! tun_is_running; then
+    log "Туннель не работает — via-маршруты подхватятся при следующем 'up'"
+    return 0
+  fi
+  client_cmd via-sync --via-file "$VIA_ROUTES"
+}
+
+via_add() {
+  via_linux_only
+  local cidr="${1:-}" dev="${2:-}" comment=""
+  [[ $# -ge 2 ]] || die "Укажите сеть и интерфейс: $0 via add 10.240.1.0/24 tun0 [-- комментарий]"
+  shift 2
+  if [[ "${1:-}" == "--" ]]; then shift; comment="$*"; fi
+  cidr="$(normalize_cidr "$cidr")"
+  [[ "$dev" =~ ^[A-Za-z0-9_.:-]+$ ]] || die "Не похоже на имя интерфейса: $dev"
+  via_file_ensure
+  if awk -v c="$cidr" -v d="$dev" '$1==c && $2==d {found=1} END{exit !found}' "$VIA_ROUTES"; then
+    log "Уже есть в списке: $cidr $dev"
+    return 0
+  fi
+  if [[ -n "$comment" ]]; then
+    printf '%s %s # %s\n' "$cidr" "$dev" "$comment" >> "$VIA_ROUTES"
+  else
+    printf '%s %s\n' "$cidr" "$dev" >> "$VIA_ROUTES"
+  fi
+  log "Записано в $VIA_ROUTES: $cidr $dev"
+  via_sync_live
+}
+
+via_del() {
+  via_linux_only
+  local cidr="${1:-}" dev="${2:-}" tmp=""
+  [[ $# -ge 1 ]] || die "Укажите сеть: $0 via del 10.240.1.0/24 [tun0]"
+  cidr="$(normalize_cidr "$cidr")"
+  via_file_ensure
+  tmp="$(mktemp)"
+  awk -v c="$cidr" -v d="$dev" '$1==c && (d=="" || $2==d) {next} {print}' "$VIA_ROUTES" > "$tmp"
+  if cmp -s "$tmp" "$VIA_ROUTES"; then
+    rm -f "$tmp"
+    log "Нет в $VIA_ROUTES: $cidr ${dev:+$dev }(проверьте 'sshtun via list')"
+    return 0
+  fi
+  mv -f "$tmp" "$VIA_ROUTES"
+  restore_owner "$VIA_ROUTES"
+  log "Удалено из $VIA_ROUTES: $cidr ${dev:+$dev}"
+  via_sync_live
+}
+
+via_sync_now() {
+  via_linux_only
+  check_client
+  tun_is_running || die "Туннель не работает — via-синк возможен только при работающем туннеле"
+  via_file_ensure
+  client_cmd via-sync --via-file "$VIA_ROUTES"
 }
 
 # --- резолвинг источников данных ---
@@ -1668,6 +1770,17 @@ list_policy() {
     fi
   done
   echo
+  echo "=== VIA (через сторонний туннель — openvpn и пр.; только Linux):"
+  echo "    sshtun via add CIDR ИНТЕРФЕЙС   /   sshtun via del CIDR [ИНТЕРФЕЙС]"
+  echo "    sshtun via list   /   sshtun via sync (принудительный синк)"
+  if [[ -f "$VIA_ROUTES" ]]; then
+    n="$(grep -cvE '^[[:space:]]*(#|$)' "$VIA_ROUTES" || true)"
+    printf '    %-18s %6s записей    %s\n' "ручной список" "$n" "$VIA_ROUTES"
+    (( n > 0 && n <= 50 )) && show_raw_entries "$VIA_ROUTES" | sed 's/^/      /'
+  else
+    printf '    %-18s %6s            %s\n' "ручной список" "—" "$VIA_ROUTES (нет файла; автодетект работает без него)"
+  fi
+  echo
   echo "Приоритет: более длинный префикс побеждает всегда (LPM); на равных — include."
 }
 
@@ -1705,6 +1818,27 @@ case "$cmd" in
       add|+)  force_add "$@" ;;
       del|-)  force_del "$@" ;;
       *) die "Неизвестная подкоманда: include $sub (нужно add|del)" ;;
+    esac ;;
+  via)
+    shift
+    [[ $# -ge 1 ]] || die "Укажите подкоманду: $0 via add|del|list|sync ..."
+    sub="${1:-}"; shift
+    case "$sub" in
+      add|+)  via_add "$@" ;;
+      del|-)  via_del "$@" ;;
+      list|ls)
+        via_linux_only
+        via_file_ensure
+        echo "=== VIA (через сторонний туннель: openvpn и пр.):"
+        echo "    добавить: sshtun via add CIDR ИНТЕРФЕЙС [-- комментарий]"
+        echo "    убрать:   sshtun via del CIDR [ИНТЕРФЕЙС]    синк: sshtun via sync"
+        echo "    файл: $VIA_ROUTES"
+        echo "    автодетект маршрутов чужих tun — включён (синк раз в 10 с под досмотром службы)"
+        show_raw_entries "$VIA_ROUTES" | sed 's/^/      /' \
+          || echo "      (пусто — автодетект работает, ручные записи не нужны)"
+        ;;
+      sync)   via_sync_now "$@" ;;
+      *) die "Неизвестная подкоманда: via $sub (нужно add|del|list|sync)" ;;
     esac ;;
   add)             shift; legacy_hint "exclude add CIDR..."; add_excludes "$@" ;;
   del)             shift; legacy_hint "exclude del CIDR..."; del_excludes "$@" ;;

@@ -10,6 +10,9 @@ IFS=$'\n\t'
 #   - cleanup command removes old traces without state file
 #   - lock prevents overlapping starts/stops
 #   - supports full-tunnel, custom tunnel routes and direct excludes
+#   - via-routes: prefixes forwarded through THIRD-PARTY tunnel interfaces
+#     (OpenVPN tun0 etc.) — auto-detected from main table + manual
+#     routes-via.txt; makes sshtun coexist with OpenVPN split-tunnel
 #   - policy routing (Tailscale-style): routes live in dedicated tables
 #     (POLICY_TABLE_DIRECT/POLICY_TABLE_TUN), main table stays untouched
 #   - big route lists (country/AS CIDRs) are applied via ip -batch
@@ -87,6 +90,18 @@ HAD_IPV6_BLACKHOLE="0"
 ROUTES_VIA_TUN=()
 EXCLUDE_ROUTES=()
 
+# Via-маршруты: префиксы, которые надо отправлять НЕ напрямую и НЕ в наш
+# туннель, а через СТОРОННИЙ туннельный интерфейс (OpenVPN tun0 и т.п.).
+# Живут в той же POLICY_TABLE_DIRECT, что и excludes (LPM: более длинный
+# префикс OpenVPN-/16..24 побеждает RFC1918-исключения /8..12). Источники:
+# автодетект маршрутов чужих tun из main-таблицы + ручной файл VIA_FILE
+# (строки "CIDR DEV [GW]", GW опционален). Watcher работает только в режиме
+# --foreground (под досмотром); без досмотра — начальный синк + 'via-sync'.
+VIA_FILE="${VIA_FILE:-}"
+VIA_AUTO_SYNC="${VIA_AUTO_SYNC:-1}"
+VIA_SYNC_INTERVAL="${VIA_SYNC_INTERVAL:-10}"
+VIA_SYNC_PID=""
+
 # Списки длиннее порога применяются одним netlink-транзакцией (ip -batch)
 # вместо посекундного цикла: 10k+ маршрутов добавляются/снимаются за секунды.
 ROUTE_BATCH_THRESHOLD="${ROUTE_BATCH_THRESHOLD:-100}"
@@ -123,6 +138,7 @@ Start options:
   --user USER              default: sshvpn
   --port PORT              default: 65523
   --tun N                  fixed tun number, for example 100
+  --via-file FILE          manual via-routes through third-party tunnels (see start options)
   --tun-start N            default: 100
   --tun-end N              default: 200
   --mtu N                  default: 1400
@@ -131,6 +147,8 @@ Start options:
   --route-file FILE        read tunnel routes from file, one CIDR per line
   --exclude CIDR           direct/bypass route via original default gateway; can be repeated
   --exclude-file FILE      read direct/bypass routes from file, one CIDR per line
+  --via-file FILE          manual via-routes ("CIDR DEV [GW]" per line) through third-party
+                           tunnel interfaces (OpenVPN); auto-detect is on by default
   --no-dns                 do not configure DNS via systemd-resolved
   --dns "1.1.1.1 8.8.8.8" DNS servers for tun interface
   --no-block-ipv6          do not add IPv6 blackhole route
@@ -148,6 +166,9 @@ Commands:
   cleanup                  force cleanup old SSH-TUN traces even if state is missing
   status                   show current state and managed leftovers
   doctor                   print routes/DNS/tun diagnostics
+  via-sync [--via-file FILE] [--auto 0|1]
+                           sync via-routes (third-party tunnels like OpenVPN)
+                           into the policy table; needs a running tunnel
 
 Examples:
   sudo $0 start --host 1.2.3.4 --key ./id_ed25519
@@ -217,6 +238,7 @@ parse_start_args() {
       --route-file) read_routes_file "${2:-}" ROUTES_VIA_TUN; shift 2 ;;
       --exclude) validate_cidr_or_ip "${2:-}" || die "Bad --exclude: ${2:-}"; EXCLUDE_ROUTES+=("$2"); shift 2 ;;
       --exclude-file) read_routes_file "${2:-}" EXCLUDE_ROUTES; shift 2 ;;
+      --via-file) VIA_FILE="${2:-}"; shift 2 ;;
       --no-dns) SET_DNS=0; shift ;;
       --dns) DNS_SERVERS="${2:-}"; shift 2 ;;
       --no-block-ipv6) BLOCK_IPV6=0; shift ;;
@@ -616,6 +638,198 @@ cleanup_owned_tuns() {
   done < <(list_owned_tuns)
 }
 
+# ---------------------------------------------------------------------
+# Via-маршруты: зеркалирование маршрутов ЧУЖИХ туннелей (OpenVPN tun0 и
+# т.п.) в POLICY_TABLE_DIRECT. Без этого OpenVPN-сети (/16-/24) глотаются
+# либо нашим catch-all (pref 25110), либо RFC1918-исключениями (/8-/12):
+# наш lookup идёт раньше main-таблицы, куда OpenVPN кладёт свои маршруты.
+# Лечится LPM внутри одной таблицы: более длинный OpenVPN-префикс побеждает.
+# Default-маршруты чужих тунов (0/0, 0/1, 128/1) НЕ зеркалируем: full-tunnel
+# OpenVPN — сценарий «останови sshtun», молча уводить трафик не будем.
+# При удалении чужого интерфейса ядро само сносит ссылающиеся маршруты из
+# ВСЕХ таблиц; watcher/синк дочищает остатки по diff'у.
+
+# Чужие tun-интерфейсы: tunN вне нашего пула (OpenVPN обычно получает tun0).
+list_foreign_tuns() {
+  ip -o link show 2>/dev/null | awk -F': ' -v p="$TUN_PREFIX" -v mn="$OWNED_TUN_MIN" -v mx="$OWNED_TUN_MAX" '
+    $2 ~ "^" p "[0-9]+$" {
+      n = $2; sub("^" p, "", n)
+      if (n + 0 < mn || n + 0 > mx) print $2
+    }'
+}
+
+# "P [via G] dev D ..." -> "P|G|D"
+parse_route_fields() {
+  awk '{p=$1; gw=""; dev=""; for(i=2;i<=NF;i++){if($i=="via")gw=$(i+1); else if($i=="dev"){dev=$(i+1); break}}
+        printf "%s|%s|%s\n", p, gw, dev}' <<<"$1"
+}
+
+via_canon_spec() { # arg "P|G|D" -> canonical spec string
+  local p="${1%%|*}"
+  local rest="${1#*|}"
+  local gw="${rest%%|*}" dev="${1##*|}"
+  if [[ -n "$gw" ]]; then printf '%s via %s dev %s' "$p" "$gw" "$dev"; else printf '%s dev %s' "$p" "$dev"; fi
+}
+
+# Желаемый набор via-спеков (канонические строки "P via G dev D" / "P dev D"):
+# 1) ручной файл VIA_FILE (строки "CIDR DEV [GW]") — приоритет над автодетектом;
+# 2) автодетект: static-маршруты чужих tun из main-таблицы (без proto kernel
+#    и default-халв). Дедуп по префиксу.
+via_collect_want() {
+  local -A seen=()
+  local line="" f="" froutes="" p="" spec="" rdev="" rgw=""
+  if [[ -f "$VIA_FILE" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%%#*}"
+      line="${line#"${line%%[![:space:]]*}"}"
+      line="${line%"${line##*[![:space:]]}"}"
+      [[ -z "$line" ]] && continue
+      rdev=""; rgw=""
+      # IFS в клиенте без пробела ($'\n\t') — читаем поля явным IFS=' '.
+      IFS=' ' read -r p rdev rgw <<<"$line"
+      if ! validate_cidr_or_ip "$p" || [[ ! "$rdev" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        log "WARNING: via: пропускаю строку '$line' в $VIA_FILE"
+        continue
+      fi
+      spec="$p"
+      [[ -n "$rgw" ]] && spec+=" via $rgw"
+      spec+=" dev $rdev"
+      if [[ -z "${seen[$p]:-}" ]]; then seen[$p]=1; echo "$spec"; fi
+    done < "$VIA_FILE"
+  fi
+  if [[ "$VIA_AUTO_SYNC" == "1" ]]; then
+    while IFS= read -r f; do
+      [[ -n "$f" ]] || continue
+      froutes="$(ip -4 route show dev "$f" 2>/dev/null)" || true
+      while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        case "$line" in *"proto kernel"*) continue ;; esac
+        p="${line%% *}"
+        case "$p" in 0.0.0.0/0|0.0.0.0/1|128.0.0.0/1) continue ;; esac
+        [[ "$p" =~ ^[0-9.]+/[0-9]+$ ]] || continue
+        spec="$(via_canon_spec "$(parse_route_fields "$line")")"
+        if [[ -z "${seen[$p]:-}" ]]; then seen[$p]=1; echo "$spec"; fi
+      done <<<"$froutes"
+    done < <(list_foreign_tuns)
+  fi
+}
+
+# Текущий набор: маршруты POLICY_TABLE_DIRECT, указывающие на чужие tun.
+# Один awk-проход на всю таблицу (12k+ строк): построчный fork на таблице
+# такого размера стоил бы десятки секунд.
+via_collect_cur() {
+  local fdevs="" pat="" d="" line=""
+  fdevs="$(list_foreign_tuns)"
+  [[ -n "$fdevs" ]] || return 0
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && pat+="${pat:+|}${d}"
+  done <<<"$fdevs"
+  ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | awk -v pat="^(${pat})$" '
+    { dev=""; gw=""; for(i=1;i<=NF;i++){ if($i=="via") gw=$(i+1); else if($i=="dev"){ dev=$(i+1); break } }
+      if (dev !~ pat) next
+      p=$1
+      if (gw != "") printf "%s via %s dev %s\n", p, gw, dev
+      else printf "%s dev %s\n", p, dev
+    }'
+}
+
+# Одна итерация синка: сначала удаляем устаревшее, потом добавляем новое
+# (иначе смена шлюза у того же префикса: add-замену снесло бы del-фазой).
+# Логирует только реально применённые изменения; неудачи молча ретраятся
+# следующей итерацией (OpenVPN может быть ещё не поднят).
+via_sync_once() {
+  local want_f="" cur_f="" spec="" p=""
+  local add_n=0 del_n=0
+  local -a a=()
+  want_f="$(via_collect_want)"
+  cur_f="$(via_collect_cur)"
+
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] || continue
+    grep -qxF -- "$spec" <<<"$want_f" && continue
+    p="${spec%% *}"
+    if ip route del "$p" table "$POLICY_TABLE_DIRECT" 2>/dev/null; then
+      del_n=$((del_n + 1))
+    fi
+  done <<<"$cur_f"
+
+  while IFS= read -r spec; do
+    [[ -n "$spec" ]] || continue
+    grep -qxF -- "$spec" <<<"$cur_f" && continue
+    a=(); IFS=' ' read -ra a <<<"$spec"
+    if ip route replace "${a[@]}" table "$POLICY_TABLE_DIRECT" 2>/dev/null; then
+      add_n=$((add_n + 1))
+    fi
+  done <<<"$want_f"
+
+  if (( add_n > 0 || del_n > 0 )); then
+    log "via-sync: +$add_n -$del_n (через сторонние туннели, таблица $POLICY_TABLE_DIRECT)"
+    return 0
+  fi
+  return 1
+}
+
+# Watcher: периодический синк под досмотром (--foreground). Живёт, пока
+# существует state-файл; stop_vpn/supervisor удаляют state — watcher уходит.
+start_via_sync_watcher() {
+  [[ "$VIA_AUTO_SYNC" == "1" || -f "$VIA_FILE" ]] || return 0
+  (
+    trap 'exit 0' TERM INT
+    while [[ -f "$STATE_FILE" ]]; do
+      sleep "$VIA_SYNC_INTERVAL" || exit 0
+      [[ -f "$STATE_FILE" ]] || exit 0
+      via_sync_once || true
+    done
+  ) &
+  VIA_SYNC_PID=$!
+  log "Via-route sync watcher started (interval ${VIA_SYNC_INTERVAL}s)"
+}
+
+stop_via_sync_watcher() {
+  if [[ -n "${VIA_SYNC_PID:-}" ]] && [[ "$VIA_SYNC_PID" =~ ^[0-9]+$ ]]; then
+    kill "$VIA_SYNC_PID" >/dev/null 2>&1 || true
+  fi
+  VIA_SYNC_PID=""
+}
+
+# Число via-маршрутов в политической таблице (для status/doctor): один
+# awk-проход, без bash-цикла по 12k строк.
+via_routes_count() {
+  local fdevs="" pat="" d=""
+  fdevs="$(list_foreign_tuns)"
+  [[ -n "$fdevs" ]] || { echo 0; return 0; }
+  while IFS= read -r d; do
+    [[ -n "$d" ]] && pat+="${pat:+|}${d}"
+  done <<<"$fdevs"
+  ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | awk -v pat="^(${pat})$" '
+    { for(i=1;i<=NF;i++) if($i=="dev"){ if($(i+1) ~ pat) c++; break } }
+    END { print c + 0 }'
+}
+
+# Команда 'via-sync' (обёртка: sshtun via sync) — принудительный синк.
+via_sync_cmd() {
+  need_root
+  need_cmds
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --via-file) VIA_FILE="${2:-}"; shift 2 ;;
+      --auto) VIA_AUTO_SYNC="${2:-}"; shift 2 ;;
+      *) die "Unknown option for via-sync: $1" ;;
+    esac
+  done
+  [[ -f "$STATE_FILE" ]] || die "Туннель не работует (нет state) — via-маршруты применяются при работающем туннеле"
+  with_lock
+  load_state_if_exists || true
+  log "Via-sync: чужие tun: $(list_foreign_tuns | tr '\n' ' ' || true)"
+  if via_sync_once; then
+    log "via-sync применил изменения"
+  else
+    log "via-sync: изменений нет (желаемый набор уже применён или недоступен)"
+  fi
+  echo "via-маршрутов в таблице $POLICY_TABLE_DIRECT: $(via_routes_count)"
+}
+
+
 cleanup_partial_start() {
   local ec=$?
   trap - EXIT INT TERM ERR
@@ -710,6 +924,7 @@ status_vpn() {
       echo "Server TUN IP: ${SERVER_TUN_IP}"
       echo "Policy: table ${POLICY_TABLE_DIRECT} (pref ${RULE_PREF_DIRECT}), table ${POLICY_TABLE_TUN} (pref ${RULE_PREF_TUN})"
       echo "Policy routes: direct=$(ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | wc -l) tun=$(ip -4 route show table "$POLICY_TABLE_TUN" 2>/dev/null | wc -l)"
+      echo "Via routes (сторонние туннели: openvpn и пр.): $(via_routes_count)"
       ip addr show "$TUN_DEV" 2>/dev/null | sed -n '1,8p' || true
     else
       if [[ "${PHASE:-}" == "starting" && "${STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
@@ -772,6 +987,15 @@ doctor_vpn() {
   echo "total: $(ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null | wc -l) routes"
   echo "-- table ${POLICY_TABLE_TUN} (full-tunnel halves) --"
   ip -4 route show table "$POLICY_TABLE_TUN" 2>/dev/null || true
+  echo
+  echo "== via-routes (сторонние туннели: openvpn и пр.) =="
+  echo "foreign tun devices: $(list_foreign_tuns | tr '\n' ' ' || true)"
+  echo "via routes in table ${POLICY_TABLE_DIRECT}: $(via_routes_count)"
+  ip -4 route show table "$POLICY_TABLE_DIRECT" 2>/dev/null \
+    | awk -v pat="$(list_foreign_tuns | paste -sd'|' - | sed 's/.*/^(&)$/' )" \
+        'pat != "^()$" { for(i=1;i<=NF;i++) if($i=="dev"){ if($(i+1) ~ pat) print; break } }' \
+    | sed -n '1,20p' || true
+  echo "via auto-sync: ${VIA_AUTO_SYNC} (interval ${VIA_SYNC_INTERVAL}s), manual file: ${VIA_FILE:-none}"
   echo
   echo "== IPv6 blackhole =="
   ip -6 route show 2>/dev/null | grep -F 'blackhole ::/0 metric 1' || true
@@ -1034,6 +1258,10 @@ configure_client_routes() {
     ip -6 route replace blackhole ::/0 metric 1 || true
   fi
 
+  # Начальный синк via-маршрутов (OpenVPN мог быть поднят ДО sshtun).
+  # Дальше — watcher'ом в supervise_vpn (режим --foreground).
+  via_sync_once || true
+
   write_state
 }
 
@@ -1044,8 +1272,10 @@ configure_client_routes() {
 supervise_vpn() {
   log "Supervising ssh process (foreground mode)"
   trap 'supervisor_on_signal' TERM INT
+  start_via_sync_watcher
   wait "$SSH_PID" 2>/dev/null || true
   SSH_PID=""
+  stop_via_sync_watcher
 
   if [[ -f "$STATE_FILE" ]]; then
     # Гонка: внешний stop_vpn убивает ssh, а rm state делает ПОСЛЕ cleanup —
@@ -1077,6 +1307,7 @@ supervisor_on_signal() {
   set +e
   trap - TERM INT EXIT ERR
   log "Stop signal received — shutting down tunnel"
+  stop_via_sync_watcher
   kill_pid_safe "${SSH_PID:-}"
   SSH_PID=""
   cleanup_routes "${TUN_DEV:-}" "${SERVER_REAL_IP:-}" "$HAD_IPV6_BLACKHOLE"
@@ -1198,6 +1429,7 @@ case "$cmd" in
   cleanup) shift; force_cleanup "$@" ;;
   status) shift; status_vpn "$@" ;;
   doctor) shift; doctor_vpn "$@" ;;
+  via-sync) shift; via_sync_cmd "$@" ;;
   -h|--help|help|"") usage ;;
   *) die "Unknown command: $cmd" ;;
 esac
